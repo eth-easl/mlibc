@@ -33,6 +33,8 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 
 namespace mlibc {
 
+void sys_exit(int status);
+
 namespace {
 namespace vfs {
 
@@ -63,14 +65,20 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 
 class FileTableEntry {
 	// internal struct definitions
+public:
 	struct FileData {
 		io_buf* buf;
 		size_t offset;
 		int flags;
+
+		int access() {
+			return this->flags & 0b11;
+		}
 	};
 	struct DirectoryData {
 
 	};
+private:
 
 
 	// fields
@@ -78,6 +86,7 @@ class FileTableEntry {
 	frg::variant<FileData, DirectoryData> data;
 	
 	friend class OpenFileList;
+	friend void sys_exit(int status);
 
 	FileTableEntry(FileData fdata) : data{std::move(fdata)} {};
 	FileTableEntry(DirectoryData dirdata) : data{std::move(dirdata)} {};
@@ -105,7 +114,7 @@ public:
 			return EISDIR;
 		} else if (this->data.is<FileData>()) {
 			FileData& fdata = this->data.get<FileData>();
-			if (!(fdata.flags & (O_RDONLY | O_RDWR))) {
+			if (!(fdata.access() == O_RDWR || fdata.access() == O_RDONLY)) {
 				*bytes_read = -1;
 				return EBADF;
 			}
@@ -134,7 +143,7 @@ public:
 			return EISDIR;
 		} else if (this->data.is<FileData>()) {
 			FileData& fdata = this->data.get<FileData>();
-			if (!(fdata.flags & (O_WRONLY | O_RDWR))) {
+			if (!(fdata.access() == O_RDWR || fdata.access() == O_WRONLY)) {
 				*bytes_written = -1;
 				return EBADF;
 			}
@@ -145,6 +154,7 @@ public:
 
 			void* write_ptr = static_cast<char*>(fdata.buf->buffer) + fdata.offset;
 			memcpy(write_ptr, buffer, size);
+			fdata.buf->size = fdata.offset + size;
 
 			*bytes_written = size;
 			fdata.offset += size;
@@ -154,6 +164,37 @@ public:
 			mlibc::panicLogger() << "Invalid FileTableEntry type encountered" << frg::endlog;
 			return EIO;
 		}
+	}
+
+	int seek(off_t offset, int whence, off_t *new_offset) {
+		if (this->data.is<DirectoryData>()) {
+			*new_offset = -1;
+			// TODO: check: is EISDIR a valid error of seek?
+			return EISDIR;
+		} else if (this->data.is<FileData>()) {
+			FileData& fdata = this->data.get<FileData>();
+			if (whence == SEEK_SET && offset >= 0) {
+				fdata.offset = static_cast<size_t>(offset);
+			} else if (whence == SEEK_CUR && (offset >= 0  || (fdata.offset >= static_cast<size_t>(-offset)))) {
+				fdata.offset += offset;
+			} else if (whence == SEEK_END && (offset >= 0 || static_cast<size_t>(-offset) <= fdata.buf->size)) {
+				fdata.offset = fdata.buf->size + offset;
+			} else {
+				*new_offset = -1;
+				return EINVAL;
+			}
+			return 0;
+		} else {
+			mlibc::panicLogger() << "Invalid FileTableEntry type encountered" << frg::endlog;
+			return EIO;
+		}
+	}
+
+	const io_buf* get_io_buf() {
+		if (this->data.is<FileData>()) {
+			return this->data.get<FileData>().buf;
+		}
+		return nullptr;
 	}
 };
 
@@ -181,9 +222,35 @@ class OpenFileList {
 		}
 		return 0;
 	}
+
+	FileTableEntry* create_file(auto&&... args) {
+		void* mem = getAllocator().allocate(sizeof(FileTableEntry));
+		new (mem) FileTableEntry{std::forward<decltype(args)...>(args...)};
+		return static_cast<FileTableEntry*>(mem);
+	}
 public:
 	OpenFileList() {
-
+		auto* stdin_file = this->create_file(
+			FileTableEntry::FileData {
+			create_io_buf(),
+			0,
+			O_RDONLY
+		});
+		auto* stdout_file = this->create_file(
+			FileTableEntry::FileData {
+			create_io_buf(),
+			0,
+			O_WRONLY
+		});
+		auto* stderr_file = this->create_file(
+			FileTableEntry::FileData {
+			create_io_buf(),
+			0,
+			O_WRONLY
+		});
+		this->files.push_back(stdin_file);
+		this->files.push_back(stdout_file);
+		this->files.push_back(stderr_file);
 	}
 
 	FileTableEntry* get(int fd) {
@@ -273,13 +340,20 @@ int sys_anon_free(void *pointer, size_t size) {
 }
 
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
-	auto ret = do_syscall(SYS_fadvise64, fd, offset, length, advice);
-	if(int e = sc_error(ret); e)
-		return e;
+	(void)fd;
+	(void)offset;
+	(void)length;
+	(void)advice;
+	// auto ret = do_syscall(SYS_fadvise64, fd, offset, length, advice);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
 	return 0;
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
+	mlibc::panicLogger() << "called sys_open" << frg::endlog;
+	return EINVAL;
+
 	auto ret = do_cp_syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 	if(int e = sc_error(ret); e)
 		return e;
@@ -288,6 +362,9 @@ int sys_open(const char *path, int flags, mode_t mode, int *fd) {
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
+	mlibc::panicLogger() << "called sys_open_at" << frg::endlog;
+	return EINVAL;
+
 	auto ret = do_syscall(SYS_openat, dirfd, path, flags, mode);
 	if (int e = sc_error(ret); e)
 		return e;
@@ -296,20 +373,25 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 }
 
 int sys_close(int fd) {
-	auto ret = do_cp_syscall(SYS_close, fd);
-	if(int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return vfs::get_open_file_list().close(fd);
+
+	// auto ret = do_cp_syscall(SYS_close, fd);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
-	auto ret = do_cp_syscall(SYS_dup3, fd, newfd, flags);
-	if(int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)flags;
+	return vfs::get_open_file_list().dup2(fd, newfd);
+
+	// auto ret = do_cp_syscall(SYS_dup3, fd, newfd, flags);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
-int sys_read_new(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
+int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 	auto* file = vfs::get_open_file_list().get(fd);
 	if (file == nullptr) {
 		return EBADF;
@@ -317,7 +399,7 @@ int sys_read_new(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 	return file->read(buffer ,size, bytes_read);
 }
 
-int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
+int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 	auto ret = do_cp_syscall(SYS_read, fd, buffer, size);
 	if(int e = sc_error(ret); e)
 		return e;
@@ -326,6 +408,14 @@ int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
+	auto* file = vfs::get_open_file_list().get(fd);
+	if (file == nullptr) {
+		return EBADF;
+	}
+	return file->write(buffer, size, bytes_written);
+}
+
+int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
 	if(int e = sc_error(ret); e)
 		return e;
@@ -334,6 +424,14 @@ int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
+	auto* file = vfs::get_open_file_list().get(fd);
+	if (file == nullptr) {
+		return EBADF;
+	}
+	return file->seek(offset, whence, new_offset);
+}
+
+int sys_seek_old(int fd, off_t offset, int whence, off_t *new_offset) {
 	auto ret = do_syscall(SYS_lseek, fd, offset, whence);
 	if(int e = sc_error(ret); e)
 		return e;
@@ -342,31 +440,49 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
 }
 
 int sys_chmod(const char *pathname, mode_t mode) {
-	auto ret = do_cp_syscall(SYS_fchmodat, AT_FDCWD, pathname, mode);
-	if(int e = sc_error(ret); e)
-		return e;
+	(void)pathname;
+	(void)mode;
 	return 0;
+	// auto ret = do_cp_syscall(SYS_fchmodat, AT_FDCWD, pathname, mode);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_fchmod(int fd, mode_t mode) {
-	auto ret = do_cp_syscall(SYS_fchmod, fd, mode);
-	if(int e = sc_error(ret); e)
-		return e;
+	(void)fd;
+	(void)mode;
 	return 0;
+	// auto ret = do_cp_syscall(SYS_fchmod, fd, mode);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
-	auto ret = do_cp_syscall(SYS_fchmodat, fd, pathname, mode, flags);
-	if(int e = sc_error(ret); e)
-		return e;
+	(void)fd;
+	(void)pathname;
+	(void)mode;
+	(void)flags;
 	return 0;
+	// auto ret = do_cp_syscall(SYS_fchmodat, fd, pathname, mode, flags);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags) {
-	auto ret = do_cp_syscall(SYS_fchownat, dirfd, pathname, owner, group, flags);
-	if(int e = sc_error(ret); e)
-		return e;
+	(void)dirfd;
+	(void)pathname;
+	(void)owner;
+	(void)group;
+	(void)flags;
 	return 0;
+
+	// auto ret = do_cp_syscall(SYS_fchownat, dirfd, pathname, owner, group, flags);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
@@ -1230,9 +1346,10 @@ void sys_thread_exit() {
 }
 
 void sys_exit(int status) {
-	constexpr char text[] = "Hello on Exit!\n";
+	auto* stdout_file = vfs::get_open_file_list().get(1);
+	const vfs::io_buf* buf = stdout_file->get_io_buf();
 	ssize_t written;
-	sys_write(1, text, sizeof(text), &written);
+	sys_write_old(1, buf->buffer, buf->size, &written);
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
