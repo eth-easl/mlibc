@@ -108,6 +108,12 @@ if host_machine.system() == 'linux'
 	rtdl_include_dirs += include_directories('sysdeps/linux/include')
 	libc_include_dirs += include_directories('sysdeps/linux/include')
 	subdir('sysdeps/linux')
+elif host_machine.system() == 'dandelion'
+	provides_bits_syscall_h = true
+	disable_linux_headers = true
+	rtdl_include_dirs += include_directories('sysdeps/dandelion/include')
+	libc_include_dirs += include_directories('sysdeps/dandelion/include')
+	subdir('sysdeps/dandelion')
 elif host_machine.system() == 'aero'
 	rtdl_include_dirs += include_directories('sysdeps/aero/include')
 	libc_include_dirs += include_directories('sysdeps/aero/include')

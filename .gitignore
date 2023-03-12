@@ -3,3 +3,5 @@ subprojects
 *.xbstrap
 # editor configs:
 .vscode
+.cache
+compile_commands.json
