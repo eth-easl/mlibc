@@ -62,6 +62,9 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 	}
 }
 
+io_buf* stdout_buf = nullptr;
+io_buf* stderr_buf = nullptr;
+
 
 class FileTableEntry {
 	// internal struct definitions
@@ -236,17 +239,21 @@ public:
 			0,
 			O_RDONLY
 		});
+
+		stdout_buf = create_io_buf();
+		stderr_buf = create_io_buf();
+
 		auto* stdout_file = this->create_file(
 			FileTableEntry::FileData {
-			create_io_buf(),
-			0,
-			O_WRONLY
+				stdout_buf,
+				0,
+				O_WRONLY
 		});
 		auto* stderr_file = this->create_file(
 			FileTableEntry::FileData {
-			create_io_buf(),
-			0,
-			O_WRONLY
+				stderr_buf,
+				0,
+				O_WRONLY
 		});
 		this->files.push_back(stdin_file);
 		this->files.push_back(stdout_file);
@@ -261,14 +268,14 @@ public:
 	}
 
 	int dup2(int srcfd, int targetfd) {
+		if (srcfd == targetfd) {
+			return 0;
+		}
 		FileTableEntry* source = this->get(srcfd);
 		if (source == nullptr) {
 			return EBADF;
 		}
-		if (FileTableEntry* target = this->get(targetfd); target) {
-			target->dec_refcount();
-			this->files[targetfd] = nullptr;
-		}
+		this->close(targetfd);
 		this->ensure_slot(targetfd);
 		this->files[targetfd] = source;
 		source->inc_refcount();
@@ -285,16 +292,18 @@ public:
 	}
 
 	int close(int fd) {
-		if (fd >= 0 && static_cast<size_t>(fd) < this->files.size() && this->files[fd] != nullptr) {
-			this->files[fd]->dec_refcount();
+		if (FileTableEntry* target = this->get(fd); target) {
+			target->dec_refcount();
+			this->files[fd] = nullptr;
+			return 0;
 		}
 		return EBADF;
 	}
 };
 
 OpenFileList& get_open_file_list() {
-	static OpenFileList list;
-	return list;
+	static frg::eternal<OpenFileList> list;
+	return *list;
 }
 
 
@@ -1346,10 +1355,8 @@ void sys_thread_exit() {
 }
 
 void sys_exit(int status) {
-	auto* stdout_file = vfs::get_open_file_list().get(1);
-	const vfs::io_buf* buf = stdout_file->get_io_buf();
 	ssize_t written;
-	sys_write_old(1, buf->buffer, buf->size, &written);
+	sys_write_old(1, vfs::stdout_buf->buffer, vfs::stdout_buf->size, &written);
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
@@ -1559,12 +1566,14 @@ int sys_getgroups(size_t size, const gid_t *list, int *retval) {
 }
 
 int sys_dup(int fd, int flags, int *newfd) {
-	__ensure(!flags);
-	auto ret = do_cp_syscall(SYS_dup, fd);
-	if (int e = sc_error(ret); e)
-		return e;
-	*newfd = sc_int_result<int>(ret);
-	return 0;
+	(void)flags;
+	return vfs::get_open_file_list().dup(fd, newfd);
+	// __ensure(!flags);
+	// auto ret = do_cp_syscall(SYS_dup, fd);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// *newfd = sc_int_result<int>(ret);
+	// return 0;
 }
 
 void sys_sync() {
