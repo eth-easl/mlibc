@@ -17,6 +17,7 @@
 
 #include <frg/vector.hpp>
 #include <frg/variant.hpp>
+// #include <frg/hash_map.hpp>
 
 #define STUB_ONLY { __ensure(!"STUB_ONLY function was called"); __builtin_unreachable(); }
 #define UNUSED(x) (void)(x);
@@ -33,22 +34,35 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 
 namespace mlibc {
 
-void sys_exit(int status);
-
-namespace {
 namespace vfs {
 
+using string = frg::string<MemoryAllocator>;
+
 struct io_buf {
+	io_buf* next;
+	const char* ident;
+
 	void* buffer;
 	size_t size;
 	size_t capacity;
 };
 
-io_buf* create_io_buf() {
+struct io_set {
+	io_set* next;
+	const char* ident;
+	io_buf* buf_head;
+};
+
+const char input_file_content[] = "This is an example input file";
+io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content), sizeof(input_file_content)};
+io_set root_input_set{nullptr, "/", &example_input_file};
+io_set root_output_set{nullptr, "/", nullptr};
+
+io_buf* create_io_buf(const char* ident, io_buf* next) {
 	constexpr size_t initial_bufsize = 1024;
 	void* loc = getAllocator().allocate(sizeof(io_buf));
 	void* initial_buffer = getAllocator().allocate(initial_bufsize);
-	new (loc) io_buf{initial_buffer, 0, initial_bufsize};
+	new (loc) io_buf{next, ident, initial_buffer, 0, initial_bufsize};
 	return static_cast<io_buf*>(loc);
 }
 
@@ -56,7 +70,9 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 	if (buf->capacity < min_capacity) {
 		size_t new_capacity = 2 * buf->capacity;
 		void* new_buf = getAllocator().allocate(new_capacity);
-		memcpy(new_buf, buf->buffer, buf->size);
+		if (buf->size > 0) {
+			memcpy(new_buf, buf->buffer, buf->size);
+		}
 		buf->buffer = new_buf;
 		buf->capacity = new_capacity;
 	}
@@ -64,6 +80,74 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 
 io_buf* stdout_buf = nullptr;
 io_buf* stderr_buf = nullptr;
+
+char* normalize_path(const char* dir, const char* path) {
+	struct PathSegment {
+		size_t begin;
+		size_t end; // exclusive
+	};
+
+	char* base;
+	if (path[0] == '/') {
+		base = static_cast<char*>(getAllocator().allocate(strlen(path) + 1));
+		strcpy(base, path);
+	} else {
+		size_t dir_len = strlen(dir) + 1;
+		size_t path_len = strlen(path) + 1;
+
+		base = static_cast<char*>(getAllocator().allocate(dir_len + path_len));
+		memcpy(base, dir, dir_len);
+		base[dir_len - 1] = '/';
+		memcpy(base + dir_len, path, path_len + 1);
+	}
+
+	frg::vector<PathSegment, MemoryAllocator> segs{getAllocator()};
+	size_t i = 0;
+	while (base[i] != '\0') {
+		while (base[i] == '/') {
+			++i;
+		}
+		if (base[i] == '.') {
+			// ../ pattern
+			if (base[i + 1] == '.' && base[i + 2] == '/') {
+				i += 2;
+				if (segs.size() > 0) {
+					segs.pop();
+				}
+				continue;
+			}
+			// ./ pattern - skip
+			if (base[i + 1] == '/') {
+				i += 1;
+				continue;
+			}
+		}
+		size_t begin_idx = i;
+		while (base[i] != '/' && base[i] != '\0') {
+			++i;
+		}
+		if (i > begin_idx) {
+			segs.emplace_back(begin_idx, i);
+		}
+	}
+
+	// if there are no segments, simply return a root path
+	if (segs.size() == 0) {
+		base[0] = '/';
+		base[1] = '\0';
+		return base;
+	}
+
+	size_t write_offset = 0;
+	for (const PathSegment& seg : segs) {
+		base[write_offset++] = '/';
+		memmove(base + write_offset, base + seg.begin, seg.end - seg.begin);
+		write_offset += seg.end - seg.begin;
+	}
+	base[write_offset++] = '\0';
+
+	return base;
+}
 
 
 class FileTableEntry {
@@ -79,7 +163,7 @@ public:
 		}
 	};
 	struct DirectoryData {
-
+		char* path;
 	};
 private:
 
@@ -88,7 +172,7 @@ private:
 	size_t refcount{1};
 	frg::variant<FileData, DirectoryData> data;
 	
-	friend class OpenFileList;
+	friend class FileTable;
 	friend void sys_exit(int status);
 
 	FileTableEntry(FileData fdata) : data{std::move(fdata)} {};
@@ -121,7 +205,7 @@ public:
 				*bytes_read = -1;
 				return EBADF;
 			}
-			if (fdata.offset >= fdata.buf->size) {
+			if (fdata.buf->buffer == nullptr || fdata.offset >= fdata.buf->size) {
 				*bytes_read = 0;
 				return 0;
 			}
@@ -201,70 +285,197 @@ public:
 	}
 };
 
-class OpenFileList {
-	frg::vector<FileTableEntry*, MemoryAllocator> files{getAllocator()};
+class FileTable {
+	frg::vector<FileTableEntry*, MemoryAllocator> open_files{getAllocator()};
+	io_buf* tempfile_head{nullptr};
+	char* working_dir{nullptr};
+	// frg::hash_map<
+	// 	frg::string<MemoryAllocator>, 
+	// 	io_buf*, 
+	// 	frg::hash<frg::string<MemoryAllocator>>, 
+	// 	MemoryAllocator
+	// > tempfiles{frg::hash<frg::string<MemoryAllocator>>{}, getAllocator()};
 
 	int find_free_slot() {
-		for (size_t i = 0; i < files.size(); ++i) {
-			if (files[i] == nullptr) {
+		for (size_t i = 0; i < open_files.size(); ++i) {
+			if (open_files[i] == nullptr) {
 				return i;
 			}
 		}
-		files.push_back(nullptr);
-		return files.size() - 1;
+		open_files.push_back(nullptr);
+		return open_files.size() - 1;
 	}
 
 	void ensure_slot(int slot) {
 		size_t target_len = static_cast<size_t>(slot) + 1;
-		this->files.resize(target_len, nullptr);
+		this->open_files.resize(target_len, nullptr);
 	}
 
 	int check_fd(int fd) {
-		if (fd < 0 || static_cast<size_t>(fd) >= this->files.size()) {
+		if (fd < 0 || static_cast<size_t>(fd) >= this->open_files.size()) {
 			return EBADF;
 		}
 		return 0;
 	}
 
-	FileTableEntry* create_file(auto&&... args) {
+	FileTableEntry* create_entry(auto&&... args) {
 		void* mem = getAllocator().allocate(sizeof(FileTableEntry));
 		new (mem) FileTableEntry{std::forward<decltype(args)...>(args...)};
 		return static_cast<FileTableEntry*>(mem);
 	}
+
+	io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
+		for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
+			if (strcmp(current->ident, buf_ident) == 0) {
+				return current;
+			}
+		}
+		return nullptr;
+	}
+
+	io_set* find_set(io_set* root, const char* set_ident, size_t ident_len) {
+		// we skip the root set, because it doesn't have an identifier
+		for (io_set* current = root->next; current != nullptr; current = current->next) {
+			if (strncmp(current->ident, set_ident, ident_len) == 0) {
+				return current;
+			}
+		}
+		return nullptr;
+	}
+
+	io_buf* add_buf_to_set(io_set* set, const char* buf_ident) {
+		auto* buf = create_io_buf(buf_ident, set->buf_head);
+		set->buf_head = buf;
+		return buf;
+	}
+
 public:
-	OpenFileList() {
-		auto* stdin_file = this->create_file(
+	FileTable() {
+		this->working_dir = static_cast<char*>(getAllocator().allocate(2));
+		this->working_dir[0] = '/';
+		this->working_dir[1] = '\0';
+
+		auto* stdin_file = this->create_entry(
 			FileTableEntry::FileData {
-			create_io_buf(),
+			create_io_buf(nullptr, nullptr),
 			0,
 			O_RDONLY
 		});
 
-		stdout_buf = create_io_buf();
-		stderr_buf = create_io_buf();
+		stdout_buf = create_io_buf(nullptr, nullptr);
+		stderr_buf = create_io_buf(nullptr, nullptr);
 
-		auto* stdout_file = this->create_file(
+		auto* stdout_file = this->create_entry(
 			FileTableEntry::FileData {
 				stdout_buf,
 				0,
 				O_WRONLY
 		});
-		auto* stderr_file = this->create_file(
+		auto* stderr_file = this->create_entry(
 			FileTableEntry::FileData {
 				stderr_buf,
 				0,
 				O_WRONLY
 		});
-		this->files.push_back(stdin_file);
-		this->files.push_back(stdout_file);
-		this->files.push_back(stderr_file);
+		this->open_files.push_back(stdin_file);
+		this->open_files.push_back(stdout_file);
+		this->open_files.push_back(stderr_file);
+
+		// TESTING
+		__ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
+		__ensure(!strcmp(normalize_path("/hello/.loca/", "../testpath/./../end/./file.txt"), "/hello/end/file.txt"));
+		add_buf_to_set(&root_output_set, "hello.txt");
 	}
+
+	int open(const char* path, int flags, int* fd) {
+		int retcode = 0;
+		char* normpath = normalize_path(this->working_dir, path);
+
+		int access = flags & 0b11;
+		
+		// look in root input set
+		// use normpath + 1 to skip initil '/' char
+		auto* buf = find_buf_in_set(&root_input_set, normpath + 1);
+		// if found, assert that access flags are readonly
+		if (buf && access != O_RDONLY) {
+			*fd = -1;
+			retcode = EACCES;
+			goto exit;
+		}
+
+		// if not found in root input, look in root output
+		if (!buf) {
+			// use normpath + 1 to skip initial '/' char
+			buf = find_buf_in_set(&root_output_set, normpath + 1);
+		}
+		
+		// TODO: search through sets
+
+		// if not found in either, we're dealing with a temporary file
+		if (!buf) {
+			// first look if we have already created a temporary file with this name
+			buf = this->tempfile_head;
+			for (; buf != nullptr; buf = buf->next) {
+				if (strcmp(buf->ident, normpath) == 0) {
+					break;
+				}
+			}
+		}
+
+		// check if the file exists even though we're trying to open exclusively
+		if (buf && (flags & O_CREAT) && (flags & O_EXCL)) {
+			*fd = -1;
+			retcode = EEXIST;
+			goto exit;
+		}
+
+		// if we couldn't find the temporary file, create one
+		if (!buf && (flags & O_CREAT)) {
+			size_t path_buf_len = strlen(normpath) + 1;
+			char* path_buf = static_cast<char*>(getAllocator().allocate(path_buf_len));
+			memcpy(path_buf, normpath, path_buf_len);
+			buf = create_io_buf(path_buf, this->tempfile_head);
+			this->tempfile_head = buf;
+		}
+
+		if (!buf) {
+			*fd = -1;
+			retcode = EACCES;
+			goto exit;
+		}
+
+		// if we're opening in truncation mode, set the size of the file to 0
+		// note that this doesn't actually modify the file buffer
+		if ((flags & O_TRUNC) && (access == O_RDWR || access == O_WRONLY)) {
+			buf->size = 0;
+		}
+
+		{
+			int slot = this->find_free_slot();
+			this->open_files[slot] = this->create_entry(
+				FileTableEntry::FileData {
+					buf,
+					flags & O_APPEND ? buf->size : 0,
+					flags,
+				}
+			);
+			*fd = slot;
+			retcode = 0;
+		}
+	exit:
+		getAllocator().free(normpath);
+		return retcode;
+	}
+
+	// int openat(int dirfd, const char* path, int flags) {
+	// 	return 
+	// }
 
 	FileTableEntry* get(int fd) {
 		if (check_fd(fd)) {
 			return nullptr;
 		}
-		return this->files[fd];
+		return this->open_files[fd];
 	}
 
 	int dup2(int srcfd, int targetfd) {
@@ -277,7 +488,7 @@ public:
 		}
 		this->close(targetfd);
 		this->ensure_slot(targetfd);
-		this->files[targetfd] = source;
+		this->open_files[targetfd] = source;
 		source->inc_refcount();
 		return 0;
 	}
@@ -294,20 +505,19 @@ public:
 	int close(int fd) {
 		if (FileTableEntry* target = this->get(fd); target) {
 			target->dec_refcount();
-			this->files[fd] = nullptr;
+			this->open_files[fd] = nullptr;
 			return 0;
 		}
 		return EBADF;
 	}
 };
 
-OpenFileList& get_open_file_list() {
-	static frg::eternal<OpenFileList> list;
+FileTable& get_file_table() {
+	static frg::eternal<FileTable> list;
 	return *list;
 }
 
 
-};
 };
 
 void sys_libc_log(const char *message) {
@@ -360,14 +570,13 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
-	mlibc::panicLogger() << "called sys_open" << frg::endlog;
-	return EINVAL;
-
-	auto ret = do_cp_syscall(SYS_openat, AT_FDCWD, path, flags, mode);
-	if(int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
+	(void)mode;
+	return vfs::get_file_table().open(path, flags, fd);
+	// auto ret = do_cp_syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
+	// *fd = sc_int_result<int>(ret);
+	// return 0;
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
@@ -382,7 +591,7 @@ int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 }
 
 int sys_close(int fd) {
-	return vfs::get_open_file_list().close(fd);
+	return vfs::get_file_table().close(fd);
 
 	// auto ret = do_cp_syscall(SYS_close, fd);
 	// if(int e = sc_error(ret); e)
@@ -392,7 +601,7 @@ int sys_close(int fd) {
 
 int sys_dup2(int fd, int flags, int newfd) {
 	(void)flags;
-	return vfs::get_open_file_list().dup2(fd, newfd);
+	return vfs::get_file_table().dup2(fd, newfd);
 
 	// auto ret = do_cp_syscall(SYS_dup3, fd, newfd, flags);
 	// if(int e = sc_error(ret); e)
@@ -401,7 +610,7 @@ int sys_dup2(int fd, int flags, int newfd) {
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
-	auto* file = vfs::get_open_file_list().get(fd);
+	auto* file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
@@ -417,7 +626,7 @@ int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	auto* file = vfs::get_open_file_list().get(fd);
+	auto* file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
@@ -433,7 +642,7 @@ int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_writte
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
-	auto* file = vfs::get_open_file_list().get(fd);
+	auto* file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
@@ -495,10 +704,15 @@ int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int 
 }
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
-	auto ret = do_cp_syscall(SYS_utimensat, dirfd, pathname, times, flags);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)dirfd;
+	(void)pathname;
+	(void)times;
+	(void)flags;
 	return 0;
+	// auto ret = do_cp_syscall(SYS_utimensat, dirfd, pathname, times, flags);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
@@ -521,6 +735,8 @@ int sys_vm_unmap(void *pointer, size_t size) {
 // All remaining functions are disabled in ldso.
 #ifndef MLIBC_BUILDING_RTDL
 
+// To support clock system calls in CHERI we need some sort of interface for calling
+// into the host
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
 	struct timespec tp = {};
 	auto ret = do_syscall(SYS_clock_gettime, clock, &tp);
@@ -640,11 +856,18 @@ int sys_fcntl(int fd, int cmd, va_list args, int *result) {
 }
 
 int sys_getcwd(char *buf, size_t size) {
-	auto ret = do_syscall(SYS_getcwd, buf, size);
-	if (int e = sc_error(ret); e) {
-		return e;
+	if (size < 2) {
+		return ERANGE;
 	}
+	buf[0] = '/';
+	buf[1] = '\0';
 	return 0;
+
+	// auto ret = do_syscall(SYS_getcwd, buf, size);
+	// if (int e = sc_error(ret); e) {
+	// 	return e;
+	// }
+	// return 0;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
@@ -655,29 +878,34 @@ int sys_unlinkat(int dfd, const char *path, int flags) {
 }
 
 int sys_sleep(time_t *secs, long *nanos) {
-	struct timespec req = {
-		.tv_sec = *secs,
-		.tv_nsec = *nanos
-	};
-	struct timespec rem = {};
-
-	auto ret = do_cp_syscall(SYS_nanosleep, &req, &rem);
-        if (int e = sc_error(ret); e)
-                return e;
-
-	*secs = rem.tv_sec;
-	*nanos = rem.tv_nsec;
+	(void)secs;
+	(void)nanos;
 	return 0;
+	// struct timespec req = {
+	// 	.tv_sec = *secs,
+	// 	.tv_nsec = *nanos
+	// };
+	// struct timespec rem = {};
+
+	// auto ret = do_cp_syscall(SYS_nanosleep, &req, &rem);
+    //     if (int e = sc_error(ret); e)
+    //             return e;
+
+	// *secs = rem.tv_sec;
+	// *nanos = rem.tv_nsec;
+	// return 0;
 }
 
 int sys_isatty(int fd) {
-	unsigned short winsizeHack[4];
-	auto ret = do_syscall(SYS_ioctl, fd, 0x5413 /* TIOCGWINSZ */, &winsizeHack);
-	if (int e = sc_error(ret); e)
-		return e;
-	auto res = sc_int_result<unsigned long>(ret);
-	if(!res) return 0;
-	return 1;
+	(void)fd;
+	return ENOTTY;
+	// unsigned short winsizeHack[4];
+	// auto ret = do_syscall(SYS_ioctl, fd, 0x5413 /* TIOCGWINSZ */, &winsizeHack);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// auto res = sc_int_result<unsigned long>(ret);
+	// if(!res) return 0;
+	// return 1;
 }
 
 #if __MLIBC_POSIX_OPTION
@@ -1535,39 +1763,50 @@ pid_t sys_getsid(pid_t pid, pid_t *sid) {
 }
 
 int sys_setsid(pid_t *sid) {
-	auto ret = do_syscall(SYS_setsid);
-	if (int e = sc_error(ret); e)
-		return e;
-	*sid = sc_int_result<pid_t>(ret);
-	return 0;
+	(void)sid;
+	return EPERM;
+	// auto ret = do_syscall(SYS_setsid);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// *sid = sc_int_result<pid_t>(ret);
+	// return 0;
 }
 
 int sys_setuid(uid_t uid) {
-	auto ret = do_syscall(SYS_setuid, uid);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)uid;
+	return EINVAL;
+	// auto ret = do_syscall(SYS_setuid, uid);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_getpgid(pid_t pid, pid_t *out) {
-	auto ret = do_syscall(SYS_getpgid, pid);
-	if (int e = sc_error(ret); e)
-		return e;
-	*out = sc_int_result<pid_t>(ret);
+	(void)pid;
+	*out = 0;
 	return 0;
+	// auto ret = do_syscall(SYS_getpgid, pid);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// *out = sc_int_result<pid_t>(ret);
+	// return 0;
 }
 
 int sys_getgroups(size_t size, const gid_t *list, int *retval) {
-	auto ret = do_syscall(SYS_getgroups, size, list);
-	if (int e = sc_error(ret); e)
-		return e;
-	*retval = sc_int_result<int>(ret);
+	(void)size;
+	(void)list;
+	*retval = 0;
 	return 0;
+	// auto ret = do_syscall(SYS_getgroups, size, list);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// *retval = sc_int_result<int>(ret);
+	// return 0;
 }
 
 int sys_dup(int fd, int flags, int *newfd) {
 	(void)flags;
-	return vfs::get_open_file_list().dup(fd, newfd);
+	return vfs::get_file_table().dup(fd, newfd);
 	// __ensure(!flags);
 	// auto ret = do_cp_syscall(SYS_dup, fd);
 	// if (int e = sc_error(ret); e)
@@ -1577,21 +1816,25 @@ int sys_dup(int fd, int flags, int *newfd) {
 }
 
 void sys_sync() {
-	do_syscall(SYS_sync);
+	// do_syscall(SYS_sync);
 }
 
 int sys_fsync(int fd) {
-	auto ret = do_syscall(SYS_fsync, fd);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)fd;
 	return 0;
+	// auto ret = do_syscall(SYS_fsync, fd);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_fdatasync(int fd) {
-	auto ret = do_syscall(SYS_fdatasync, fd);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)fd;
 	return 0;
+	// auto ret = do_syscall(SYS_fdatasync, fd);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {

@@ -1,0 +1,6 @@
+#ifndef MLIBC_DANDELION_H
+#define MLIBC_DANDELION_H
+
+#define DANDELION_AVAILABLE 1
+
+#endif
