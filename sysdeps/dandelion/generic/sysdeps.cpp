@@ -34,6 +34,50 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 
 namespace mlibc {
 
+template <typename T>
+class box {
+	T* ptr{nullptr};
+	void destroy() {
+		if (this->ptr) {
+			this->ptr->~T();
+			getAllocator().free(this->ptr);
+		}
+	}
+public:
+	~box() {
+		this->destroy();
+	}
+	box(T* ptr) : ptr{ptr} {}
+	box(box const&) = delete;
+	box(box&& other) : ptr{other.ptr} {
+		other.ptr = nullptr;
+	}
+	box& operator=(box&& other) {
+		this->destroy();
+		this->ptr = other.ptr;
+		other.ptr = nullptr;
+	}
+	box& operator=(box const&) = delete;
+	T& operator*() {
+		return *this->ptr;
+	}
+	T const& operator*() const {
+		return *this->ptr;
+	}
+	T* operator->() {
+		return this->ptr;
+	}
+	T& operator[](long long offset) {
+		return this->ptr[offset];
+	}
+	T const& operator[](long long offset) const {
+		return this->ptr[offset];
+	}
+	T* get() {
+		return this->ptr;
+	}
+};
+
 namespace vfs {
 
 using string = frg::string<MemoryAllocator>;
@@ -98,7 +142,7 @@ char* normalize_path(const char* dir, const char* path) {
 		base = static_cast<char*>(getAllocator().allocate(dir_len + path_len));
 		memcpy(base, dir, dir_len);
 		base[dir_len - 1] = '/';
-		memcpy(base + dir_len, path, path_len + 1);
+		memcpy(base + dir_len, path, path_len);
 	}
 
 	frg::vector<PathSegment, MemoryAllocator> segs{getAllocator()};
@@ -283,6 +327,13 @@ public:
 		}
 		return nullptr;
 	}
+
+	const char* get_dirpath() {
+		if (this->data.is<DirectoryData>()) {
+			return this->data.get<DirectoryData>().path;
+		}
+		return nullptr;
+	}
 };
 
 class FileTable {
@@ -387,20 +438,17 @@ public:
 		add_buf_to_set(&root_output_set, "hello.txt");
 	}
 
-	int open(const char* path, int flags, int* fd) {
-		int retcode = 0;
-		char* normpath = normalize_path(this->working_dir, path);
+	int open_normalized(const char* normpath, int flags, int* fd) {
 
 		int access = flags & 0b11;
 		
 		// look in root input set
-		// use normpath + 1 to skip initil '/' char
+		// use normpath + 1 to skip initial '/' char
 		auto* buf = find_buf_in_set(&root_input_set, normpath + 1);
 		// if found, assert that access flags are readonly
 		if (buf && access != O_RDONLY) {
 			*fd = -1;
-			retcode = EACCES;
-			goto exit;
+			return EACCES;
 		}
 
 		// if not found in root input, look in root output
@@ -409,7 +457,7 @@ public:
 			buf = find_buf_in_set(&root_output_set, normpath + 1);
 		}
 		
-		// TODO: search through sets
+		// TODO: search through other sets
 
 		// if not found in either, we're dealing with a temporary file
 		if (!buf) {
@@ -425,8 +473,7 @@ public:
 		// check if the file exists even though we're trying to open exclusively
 		if (buf && (flags & O_CREAT) && (flags & O_EXCL)) {
 			*fd = -1;
-			retcode = EEXIST;
-			goto exit;
+			return EEXIST;
 		}
 
 		// if we couldn't find the temporary file, create one
@@ -440,8 +487,7 @@ public:
 
 		if (!buf) {
 			*fd = -1;
-			retcode = EACCES;
-			goto exit;
+			return EACCES;
 		}
 
 		// if we're opening in truncation mode, set the size of the file to 0
@@ -450,26 +496,41 @@ public:
 			buf->size = 0;
 		}
 
-		{
-			int slot = this->find_free_slot();
-			this->open_files[slot] = this->create_entry(
-				FileTableEntry::FileData {
-					buf,
-					flags & O_APPEND ? buf->size : 0,
-					flags,
-				}
-			);
-			*fd = slot;
-			retcode = 0;
-		}
-	exit:
-		getAllocator().free(normpath);
-		return retcode;
+		int slot = this->find_free_slot();
+		this->open_files[slot] = this->create_entry(
+			FileTableEntry::FileData {
+				buf,
+				flags & O_APPEND ? buf->size : 0,
+				flags,
+			}
+		);
+		*fd = slot;
+		return 0;
 	}
 
-	// int openat(int dirfd, const char* path, int flags) {
-	// 	return 
-	// }
+	int open(const char* path, int flags, int* fd) {
+		char* normpath = normalize_path(this->working_dir, path);
+		int code = this->open_normalized(normpath, flags, fd);
+		getAllocator().free(normpath);
+		return code;
+	}
+
+	int openat(int dirfd, const char* path, int flags, int* fd) {
+		auto* entry = this->get(dirfd);
+		if (entry == nullptr) {
+			*fd = -1;
+			return EBADF;
+		}
+		const char* dirpath = entry->get_dirpath();
+		if (dirpath == nullptr) {
+			*fd = -1;
+			return EBADF;
+		}
+		char* normpath = normalize_path(dirpath, path);
+		int code = this->open_normalized(normpath, flags, fd);
+		getAllocator().free(normpath);
+		return code;
+	}
 
 	FileTableEntry* get(int fd) {
 		if (check_fd(fd)) {
