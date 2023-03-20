@@ -19,6 +19,8 @@
 #include <frg/variant.hpp>
 // #include <frg/hash_map.hpp>
 
+#include <dandelion.h>
+
 #define STUB_ONLY { __ensure(!"STUB_ONLY function was called"); __builtin_unreachable(); }
 #define UNUSED(x) (void)(x);
 
@@ -80,34 +82,31 @@ public:
 
 namespace vfs {
 
-using string = frg::string<MemoryAllocator>;
+void test_init_dandelion() {
 
-struct io_buf {
-	io_buf* next;
-	const char* ident;
+	static const char input_file_content[] = "This is an example input file";
+	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content), sizeof(input_file_content)};
 
-	void* buffer;
-	size_t size;
-	size_t capacity;
-};
+	dandelion.stdin = {nullptr, nullptr, nullptr, 0, 0};
+	dandelion.root_input_set = {nullptr, "/", &example_input_file};
+	dandelion.root_output_set = {nullptr, "/", nullptr};
+}
 
-struct io_set {
-	io_set* next;
-	const char* ident;
-	io_buf* buf_head;
-};
-
-const char input_file_content[] = "This is an example input file";
-io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content), sizeof(input_file_content)};
-io_set root_input_set{nullptr, "/", &example_input_file};
-io_set root_output_set{nullptr, "/", nullptr};
-
-io_buf* create_io_buf(const char* ident, io_buf* next) {
+void init_io_buf(io_buf* buf, const char* ident, io_buf* next) {
 	constexpr size_t initial_bufsize = 1024;
-	void* loc = getAllocator().allocate(sizeof(io_buf));
-	void* initial_buffer = getAllocator().allocate(initial_bufsize);
-	new (loc) io_buf{next, ident, initial_buffer, 0, initial_bufsize};
-	return static_cast<io_buf*>(loc);
+
+	if (ident) {
+		char* owned_ident = static_cast<char*>(getAllocator().allocate(strlen(ident) + 1));
+		strcpy(owned_ident, ident);
+		buf->ident = owned_ident;
+	} else {
+		buf->ident = nullptr;
+	}
+
+	buf->next = next;
+	buf->buffer = getAllocator().allocate(initial_bufsize);
+	buf->size = 0;
+	buf->capacity = initial_bufsize;
 }
 
 void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
@@ -122,8 +121,32 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 	}
 }
 
-io_buf* stdout_buf = nullptr;
-io_buf* stderr_buf = nullptr;
+io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
+	for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
+		if (strcmp(current->ident, buf_ident) == 0) {
+			return current;
+		}
+	}
+	return nullptr;
+}
+
+io_set* find_set(io_set* root, const char* set_ident, size_t ident_len) {
+	// we skip the root set, because it doesn't have an identifier
+	for (io_set* current = root->next; current != nullptr; current = current->next) {
+		if (strncmp(current->ident, set_ident, ident_len) == 0) {
+			return current;
+		}
+	}
+	return nullptr;
+}
+
+io_buf* add_buf_to_set(io_set* set, const char* buf_ident) {
+	auto* buf = static_cast<io_buf*>(getAllocator().allocate(sizeof(io_buf)));
+	::new (buf) io_buf;
+	init_io_buf(buf, buf_ident, set->buf_head);
+	set->buf_head = buf;
+	return buf;
+}
 
 char* normalize_path(const char* dir, const char* path) {
 	struct PathSegment {
@@ -338,14 +361,8 @@ public:
 
 class FileTable {
 	frg::vector<FileTableEntry*, MemoryAllocator> open_files{getAllocator()};
-	io_buf* tempfile_head{nullptr};
+	io_set tempfiles{nullptr, nullptr, nullptr};
 	char* working_dir{nullptr};
-	// frg::hash_map<
-	// 	frg::string<MemoryAllocator>, 
-	// 	io_buf*, 
-	// 	frg::hash<frg::string<MemoryAllocator>>, 
-	// 	MemoryAllocator
-	// > tempfiles{frg::hash<frg::string<MemoryAllocator>>{}, getAllocator()};
 
 	int find_free_slot() {
 		for (size_t i = 0; i < open_files.size(); ++i) {
@@ -375,56 +392,33 @@ class FileTable {
 		return static_cast<FileTableEntry*>(mem);
 	}
 
-	io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
-		for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
-			if (strcmp(current->ident, buf_ident) == 0) {
-				return current;
-			}
-		}
-		return nullptr;
-	}
-
-	io_set* find_set(io_set* root, const char* set_ident, size_t ident_len) {
-		// we skip the root set, because it doesn't have an identifier
-		for (io_set* current = root->next; current != nullptr; current = current->next) {
-			if (strncmp(current->ident, set_ident, ident_len) == 0) {
-				return current;
-			}
-		}
-		return nullptr;
-	}
-
-	io_buf* add_buf_to_set(io_set* set, const char* buf_ident) {
-		auto* buf = create_io_buf(buf_ident, set->buf_head);
-		set->buf_head = buf;
-		return buf;
-	}
-
 public:
 	FileTable() {
+		test_init_dandelion();
+
 		this->working_dir = static_cast<char*>(getAllocator().allocate(2));
 		this->working_dir[0] = '/';
 		this->working_dir[1] = '\0';
 
+		init_io_buf(&dandelion.stdout, nullptr, nullptr);
+		init_io_buf(&dandelion.stderr, nullptr, nullptr);
+
 		auto* stdin_file = this->create_entry(
 			FileTableEntry::FileData {
-			create_io_buf(nullptr, nullptr),
-			0,
-			O_RDONLY
+				&dandelion.stdin,
+				0,
+				O_RDONLY
 		});
-
-		stdout_buf = create_io_buf(nullptr, nullptr);
-		stderr_buf = create_io_buf(nullptr, nullptr);
 
 		auto* stdout_file = this->create_entry(
 			FileTableEntry::FileData {
-				stdout_buf,
+				&dandelion.stdout,
 				0,
 				O_WRONLY
 		});
 		auto* stderr_file = this->create_entry(
 			FileTableEntry::FileData {
-				stderr_buf,
+				&dandelion.stderr,
 				0,
 				O_WRONLY
 		});
@@ -435,7 +429,20 @@ public:
 		// TESTING
 		__ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
 		__ensure(!strcmp(normalize_path("/hello/.loca/", "../testpath/./../end/./file.txt"), "/hello/end/file.txt"));
-		add_buf_to_set(&root_output_set, "hello.txt");
+		add_buf_to_set(&dandelion.root_output_set, "hello.txt");
+	}
+
+	int set_cwd(const char* path) {
+		size_t newpathlen = strlen(path);
+		size_t cwdlen = strlen(this->working_dir);
+		if (newpathlen <= cwdlen) {
+			strcpy(this->working_dir, path);
+		}
+		return 0;
+	}
+
+	const char* get_cwd() const {
+		return this->working_dir;
 	}
 
 	int open_normalized(const char* normpath, int flags, int* fd) {
@@ -444,7 +451,7 @@ public:
 		
 		// look in root input set
 		// use normpath + 1 to skip initial '/' char
-		auto* buf = find_buf_in_set(&root_input_set, normpath + 1);
+		auto* buf = find_buf_in_set(&dandelion.root_input_set, normpath + 1);
 		// if found, assert that access flags are readonly
 		if (buf && access != O_RDONLY) {
 			*fd = -1;
@@ -454,20 +461,14 @@ public:
 		// if not found in root input, look in root output
 		if (!buf) {
 			// use normpath + 1 to skip initial '/' char
-			buf = find_buf_in_set(&root_output_set, normpath + 1);
+			buf = find_buf_in_set(&dandelion.root_output_set, normpath + 1);
 		}
 		
 		// TODO: search through other sets
 
 		// if not found in either, we're dealing with a temporary file
 		if (!buf) {
-			// first look if we have already created a temporary file with this name
-			buf = this->tempfile_head;
-			for (; buf != nullptr; buf = buf->next) {
-				if (strcmp(buf->ident, normpath) == 0) {
-					break;
-				}
-			}
+			buf = find_buf_in_set(&this->tempfiles, normpath);
 		}
 
 		// check if the file exists even though we're trying to open exclusively
@@ -478,11 +479,7 @@ public:
 
 		// if we couldn't find the temporary file, create one
 		if (!buf && (flags & O_CREAT)) {
-			size_t path_buf_len = strlen(normpath) + 1;
-			char* path_buf = static_cast<char*>(getAllocator().allocate(path_buf_len));
-			memcpy(path_buf, normpath, path_buf_len);
-			buf = create_io_buf(path_buf, this->tempfile_head);
-			this->tempfile_head = buf;
+			buf = add_buf_to_set(&this->tempfiles, normpath);
 		}
 
 		if (!buf) {
@@ -516,6 +513,9 @@ public:
 	}
 
 	int openat(int dirfd, const char* path, int flags, int* fd) {
+		if (dirfd == AT_FDCWD) {
+			return this->open(path, flags, fd);
+		}
 		auto* entry = this->get(dirfd);
 		if (entry == nullptr) {
 			*fd = -1;
@@ -585,13 +585,16 @@ void sys_libc_log(const char *message) {
 	size_t n = 0;
 	while(message[n])
 		n++;
-	do_syscall(SYS_write, 2, message, n);
 	char lf = '\n';
-	do_syscall(SYS_write, 2, &lf, 1);
+	ssize_t written;
+	sys_write(2, message, n, &written);
+	sys_write(2, &lf, 1, &written);
 }
 
 void sys_libc_panic() {
-	__builtin_trap();
+	// __builtin_trap();
+	// try exiting abnormally instead of causing trap
+	sys_exit(6); 
 }
 
 int sys_tcb_set(void *pointer) {
@@ -615,59 +618,33 @@ int sys_anon_allocate(size_t size, void **pointer) {
 	return sys_vm_map(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
 			-1, 0, pointer);
 }
+
 int sys_anon_free(void *pointer, size_t size) {
 	return sys_vm_unmap(pointer, size);
 }
 
 int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
-	(void)fd;
-	(void)offset;
-	(void)length;
-	(void)advice;
-	// auto ret = do_syscall(SYS_fadvise64, fd, offset, length, advice);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
+	(void)fd, (void)offset, (void)length, (void)advice;
 	return 0;
 }
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
 	(void)mode;
 	return vfs::get_file_table().open(path, flags, fd);
-	// auto ret = do_cp_syscall(SYS_openat, AT_FDCWD, path, flags, mode);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// *fd = sc_int_result<int>(ret);
-	// return 0;
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
-	mlibc::panicLogger() << "called sys_open_at" << frg::endlog;
-	return EINVAL;
-
-	auto ret = do_syscall(SYS_openat, dirfd, path, flags, mode);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
+	(void)mode;
+	return vfs::get_file_table().openat(dirfd, path, flags, fd);
 }
 
 int sys_close(int fd) {
 	return vfs::get_file_table().close(fd);
-
-	// auto ret = do_cp_syscall(SYS_close, fd);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_dup2(int fd, int flags, int newfd) {
 	(void)flags;
 	return vfs::get_file_table().dup2(fd, newfd);
-
-	// auto ret = do_cp_syscall(SYS_dup3, fd, newfd, flags);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
@@ -722,20 +699,12 @@ int sys_chmod(const char *pathname, mode_t mode) {
 	(void)pathname;
 	(void)mode;
 	return 0;
-	// auto ret = do_cp_syscall(SYS_fchmodat, AT_FDCWD, pathname, mode);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_fchmod(int fd, mode_t mode) {
 	(void)fd;
 	(void)mode;
 	return 0;
-	// auto ret = do_cp_syscall(SYS_fchmod, fd, mode);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
@@ -744,10 +713,6 @@ int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
 	(void)mode;
 	(void)flags;
 	return 0;
-	// auto ret = do_cp_syscall(SYS_fchmodat, fd, pathname, mode, flags);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags) {
@@ -757,23 +722,11 @@ int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int 
 	(void)group;
 	(void)flags;
 	return 0;
-
-	// auto ret = do_cp_syscall(SYS_fchownat, dirfd, pathname, owner, group, flags);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
-	(void)dirfd;
-	(void)pathname;
-	(void)times;
-	(void)flags;
+	(void)dirfd, (void)pathname, (void)times, (void)flags;
 	return 0;
-	// auto ret = do_cp_syscall(SYS_utimensat, dirfd, pathname, times, flags);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
@@ -796,8 +749,6 @@ int sys_vm_unmap(void *pointer, size_t size) {
 // All remaining functions are disabled in ldso.
 #ifndef MLIBC_BUILDING_RTDL
 
-// To support clock system calls in CHERI we need some sort of interface for calling
-// into the host
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
 	struct timespec tp = {};
 	auto ret = do_syscall(SYS_clock_gettime, clock, &tp);
@@ -809,12 +760,10 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_clock_getres(int clock, time_t *secs, long *nanos) {
-	struct timespec tp = {};
-	auto ret = do_syscall(SYS_clock_getres, clock, &tp);
-	if (int e = sc_error(ret); e)
-		return e;
-	*secs = tp.tv_sec;
-	*nanos = tp.tv_nsec;
+	(void)clock;
+	// pretend that all clocks have microsecond precision
+	*secs = 0;
+	*nanos = 1000;
 	return 0;
 }
 
@@ -846,37 +795,40 @@ int sys_fstatfs(int fd, struct statfs *buf) {
 	return 0;
 }
 
-extern "C" void __mlibc_signal_restore(void);
+// extern "C" void __mlibc_signal_restore(void);
 
 int sys_sigaction(int signum, const struct sigaction *act,
                 struct sigaction *oldact) {
-	struct ksigaction {
-		void (*handler)(int);
-		unsigned long flags;
-		void (*restorer)(void);
-		sigset_t mask;
-	};
+	(void)signum, (void)act, (void)oldact;
+	// pretend that we installed the signal handler
+	return 0; 
+	// struct ksigaction {
+	// 	void (*handler)(int);
+	// 	unsigned long flags;
+	// 	void (*restorer)(void);
+	// 	sigset_t mask;
+	// };
 
-	struct ksigaction kernel_act, kernel_oldact;
-	if (act) {
-		kernel_act.handler = act->sa_handler;
-		kernel_act.flags = act->sa_flags | SA_RESTORER;
-		kernel_act.restorer = __mlibc_signal_restore;
-		kernel_act.mask = act->sa_mask;
-	}
-        auto ret = do_syscall(SYS_rt_sigaction, signum, act ?
-			&kernel_act : NULL, oldact ?
-			&kernel_oldact : NULL, sizeof(sigset_t));
-        if (int e = sc_error(ret); e)
-                return e;
+	// struct ksigaction kernel_act, kernel_oldact;
+	// if (act) {
+	// 	kernel_act.handler = act->sa_handler;
+	// 	kernel_act.flags = act->sa_flags | SA_RESTORER;
+	// 	kernel_act.restorer = __mlibc_signal_restore;
+	// 	kernel_act.mask = act->sa_mask;
+	// }
+    //     auto ret = do_syscall(SYS_rt_sigaction, signum, act ?
+	// 		&kernel_act : NULL, oldact ?
+	// 		&kernel_oldact : NULL, sizeof(sigset_t));
+    //     if (int e = sc_error(ret); e)
+    //             return e;
 
-	if (oldact) {
-		oldact->sa_handler = kernel_oldact.handler;
-		oldact->sa_flags = kernel_oldact.flags;
-		oldact->sa_restorer = kernel_oldact.restorer;
-		oldact->sa_mask = kernel_oldact.mask;
-	}
-        return 0;
+	// if (oldact) {
+	// 	oldact->sa_handler = kernel_oldact.handler;
+	// 	oldact->sa_flags = kernel_oldact.flags;
+	// 	oldact->sa_restorer = kernel_oldact.restorer;
+	// 	oldact->sa_mask = kernel_oldact.mask;
+	// }
+    //     return 0;
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {
@@ -917,18 +869,13 @@ int sys_fcntl(int fd, int cmd, va_list args, int *result) {
 }
 
 int sys_getcwd(char *buf, size_t size) {
-	if (size < 2) {
+	const char* cwd = vfs::get_file_table().get_cwd();
+	size_t cwd_len = strlen(cwd) + 1;
+	if (size < cwd_len) {
 		return ERANGE;
 	}
-	buf[0] = '/';
-	buf[1] = '\0';
+	strcpy(buf, cwd);
 	return 0;
-
-	// auto ret = do_syscall(SYS_getcwd, buf, size);
-	// if (int e = sc_error(ret); e) {
-	// 	return e;
-	// }
-	// return 0;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
@@ -942,31 +889,11 @@ int sys_sleep(time_t *secs, long *nanos) {
 	(void)secs;
 	(void)nanos;
 	return 0;
-	// struct timespec req = {
-	// 	.tv_sec = *secs,
-	// 	.tv_nsec = *nanos
-	// };
-	// struct timespec rem = {};
-
-	// auto ret = do_cp_syscall(SYS_nanosleep, &req, &rem);
-    //     if (int e = sc_error(ret); e)
-    //             return e;
-
-	// *secs = rem.tv_sec;
-	// *nanos = rem.tv_nsec;
-	// return 0;
 }
 
 int sys_isatty(int fd) {
 	(void)fd;
 	return ENOTTY;
-	// unsigned short winsizeHack[4];
-	// auto ret = do_syscall(SYS_ioctl, fd, 0x5413 /* TIOCGWINSZ */, &winsizeHack);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// auto res = sc_int_result<unsigned long>(ret);
-	// if(!res) return 0;
-	// return 1;
 }
 
 #if __MLIBC_POSIX_OPTION
@@ -981,12 +908,11 @@ int sys_isatty(int fd) {
 #include <fcntl.h>
 
 int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
-	auto ret = do_syscall(SYS_ioctl, fd, request, arg);
-	if (int e = sc_error(ret); e)
-		return e;
-	if (result)
-		*result = sc_int_result<unsigned long>(ret);
-	return 0;
+	(void)fd;
+	(void)request;
+	(void)arg;
+	(void)result;
+	return ENOTTY;
 }
 
 int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -1031,26 +957,24 @@ int sys_pipe(int *fds, int flags) {
 }
 
 int sys_fork(pid_t *child) {
-	auto ret = do_syscall(SYS_clone, SIGCHLD, 0);
-	if (int e = sc_error(ret); e)
-			return e;
-	*child = sc_int_result<int>(ret);
-	return 0;
+	(void)child;
+	return ENOSYS;
 }
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
-	auto ret = do_syscall(SYS_wait4, pid, status, flags, ru);
-	if (int e = sc_error(ret); e)
-			return e;
-	*ret_pid = sc_int_result<int>(ret);
-	return 0;
+	(void)pid;
+	(void)status;
+	(void)flags;
+	(void)ru;
+	(void)ret_pid;
+	return ECHILD;
 }
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) {
-        auto ret = do_syscall(SYS_execve, path, argv, envp);
-        if (int e = sc_error(ret); e)
-                return e;
-        return 0;
+	(void)path;
+	(void)argv;
+	(void)envp;
+	return EACCES;
 }
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
@@ -1096,7 +1020,7 @@ int sys_sysinfo(struct sysinfo *info) {
 }
 
 void sys_yield() {
-	do_syscall(SYS_sched_yield);
+	// do_syscall(SYS_sched_yield);
 }
 
 int sys_clone(void *tcb, pid_t *pid_out, void *stack) {
@@ -1252,34 +1176,33 @@ int sys_listen(int fd, int backlog) {
 }
 
 int sys_getpriority(int which, id_t who, int *value) {
-	auto ret = do_syscall(SYS_getpriority, which, who);
-	if (int e = sc_error(ret); e) {
-		return e;
-	}
-	*value = 20 - sc_int_result<int>(ret);
+	(void)which;
+	(void)who;
+	*value = 0;
 	return 0;
 }
 
 int sys_setpriority(int which, id_t who, int prio) {
-	auto ret = do_syscall(SYS_setpriority, which, who, prio);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)which;
+	(void)who;
+	(void)prio;
 	return 0;
 }
 
 int sys_setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value) {
-	auto ret = do_syscall(SYS_setitimer, which, new_value, old_value);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)which;
+	(void)new_value;
+	(void)old_value;
 	return 0;
 }
 
 int sys_ptrace(long req, pid_t pid, void *addr, void *data, long *out) {
-	auto ret = do_syscall(SYS_ptrace, req, pid, addr, data);
-	if (int e = sc_error(ret); e)
-		return e;
-	*out = sc_int_result<long>(ret);
-	return 0;
+	(void)req;
+	(void)pid;
+	(void)addr;
+	(void)data;
+	(void)out;
+	return EPERM;
 }
 
 int sys_open_dir(const char *path, int *fd) {
@@ -1532,49 +1455,18 @@ int sys_inotify_rm_watch(int ifd, int wd) {
 }
 
 int sys_ttyname(int fd, char *buf, size_t size) {
-	if (!isatty(fd))
-		return errno;
-
-	char *procname;
-	if(int e = asprintf(&procname, "/proc/self/fd/%i", fd); e)
-		return ENOMEM;
-	__ensure(procname);
-
-	ssize_t l = readlink(procname, buf, size);
-	free(procname);
-
-	if (l < 0)
-		return errno;
-	else if ((size_t)l >= size)
-		return ERANGE;
-
-	buf[l] = '\0';
-	struct stat st1;
-	struct stat st2;
-
-	if (stat(buf, &st1) || fstat(fd, &st2))
-		return errno;
-	if (st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino)
-		return ENODEV;
-
-	return 0;
+	(void)fd;
+	(void)buf;
+	(void)size;
+	return ENOTTY;
 }
 
 int sys_pause() {
-#ifdef SYS_pause
-	auto ret = do_syscall(SYS_pause);
-#else
-	auto ret = do_syscall(SYS_ppoll, 0, 0, 0, 0);
-#endif
-	if (int e = sc_error(ret); e)
-		return e;
 	return EINTR;
 }
 
 int sys_mlockall(int flags) {
-	auto ret = do_syscall(SYS_mlockall, flags);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)flags;
 	return 0;
 }
 
@@ -1589,46 +1481,37 @@ int sys_times(struct tms *tms, clock_t *out) {
 }
 
 pid_t sys_getpid() {
-	auto ret = do_syscall(SYS_getpid);
-	// getpid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 pid_t sys_gettid() {
-	auto ret = do_syscall(SYS_gettid);
-	// gettid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	// dandelion is single-threaded by design
+	return 1;
+	// auto ret = do_syscall(SYS_gettid);
+	// // gettid() always succeeds.
+	// return sc_int_result<pid_t>(ret);
 }
 
 uid_t sys_getuid() {
-	auto ret = do_syscall(SYS_getuid);
-	// getuid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 uid_t sys_geteuid() {
-	auto ret = do_syscall(SYS_geteuid);
-	// geteuid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 gid_t sys_getgid() {
-	auto ret = do_syscall(SYS_getgid);
-	// getgid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 gid_t sys_getegid() {
-	auto ret = do_syscall(SYS_getegid);
-	// getegid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 int sys_kill(int pid, int sig) {
-	auto ret = do_syscall(SYS_kill, pid, sig);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)pid;
+	(void)sig;
+	return EPERM;
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
@@ -1645,7 +1528,7 @@ void sys_thread_exit() {
 
 void sys_exit(int status) {
 	ssize_t written;
-	sys_write_old(1, vfs::stdout_buf->buffer, vfs::stdout_buf->size, &written);
+	sys_write_old(1, dandelion.stdout.buffer, dandelion.stdout.size, &written);
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
@@ -1676,17 +1559,14 @@ int sys_futex_wake(int *pointer) {
 }
 
 int sys_sigsuspend(const sigset_t *set) {
-	auto ret = do_syscall(SYS_rt_sigsuspend, set, NSIG / 8);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)set;
+	return EINTR;
 }
 
 int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
-	auto ret = do_syscall(SYS_sigaltstack, ss, oss);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)ss;
+	(void)oss;
+	return EPERM;
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
@@ -1730,25 +1610,25 @@ int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
 }
 
 int sys_umask(mode_t mode, mode_t *old) {
-	auto ret = do_syscall(SYS_umask, mode);
-	if (int e = sc_error(ret); e)
-		return e;
-	*old = sc_int_result<mode_t>(ret);
+	(void)mode;
+	*old = 0777;
 	return 0;
 }
 
 int sys_chdir(const char *path) {
-	auto ret = do_syscall(SYS_chdir, path);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return vfs::get_file_table().set_cwd(path);
 }
 
 int sys_fchdir(int fd) {
-	auto ret = do_syscall(SYS_fchdir, fd);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	auto* entry = vfs::get_file_table().get(fd);
+	if (entry == nullptr) {
+		return EBADF;
+	}
+	auto* path = entry->get_dirpath();
+	if (path == nullptr) {
+		return ENOTDIR;
+	}
+	return sys_chdir(path);
 }
 
 int sys_rename(const char *old_path, const char *new_path) {
@@ -1826,31 +1706,17 @@ pid_t sys_getsid(pid_t pid, pid_t *sid) {
 int sys_setsid(pid_t *sid) {
 	(void)sid;
 	return EPERM;
-	// auto ret = do_syscall(SYS_setsid);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// *sid = sc_int_result<pid_t>(ret);
-	// return 0;
 }
 
 int sys_setuid(uid_t uid) {
 	(void)uid;
 	return EINVAL;
-	// auto ret = do_syscall(SYS_setuid, uid);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_getpgid(pid_t pid, pid_t *out) {
 	(void)pid;
 	*out = 0;
 	return 0;
-	// auto ret = do_syscall(SYS_getpgid, pid);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// *out = sc_int_result<pid_t>(ret);
-	// return 0;
 }
 
 int sys_getgroups(size_t size, const gid_t *list, int *retval) {
@@ -1858,44 +1724,23 @@ int sys_getgroups(size_t size, const gid_t *list, int *retval) {
 	(void)list;
 	*retval = 0;
 	return 0;
-	// auto ret = do_syscall(SYS_getgroups, size, list);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// *retval = sc_int_result<int>(ret);
-	// return 0;
 }
 
 int sys_dup(int fd, int flags, int *newfd) {
 	(void)flags;
 	return vfs::get_file_table().dup(fd, newfd);
-	// __ensure(!flags);
-	// auto ret = do_cp_syscall(SYS_dup, fd);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// *newfd = sc_int_result<int>(ret);
-	// return 0;
 }
 
-void sys_sync() {
-	// do_syscall(SYS_sync);
-}
+void sys_sync() {}
 
 int sys_fsync(int fd) {
 	(void)fd;
 	return 0;
-	// auto ret = do_syscall(SYS_fsync, fd);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_fdatasync(int fd) {
 	(void)fd;
 	return 0;
-	// auto ret = do_syscall(SYS_fdatasync, fd);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {
