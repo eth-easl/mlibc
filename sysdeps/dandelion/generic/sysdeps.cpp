@@ -14,10 +14,11 @@
 #include <limits.h>
 #include <sys/syscall.h>
 #include "cxx-syscall.hpp"
+#include "frg/string.hpp"
 
 #include <frg/vector.hpp>
 #include <frg/variant.hpp>
-// #include <frg/hash_map.hpp>
+#include <frg/hash_map.hpp>
 
 #include <dandelion.h>
 
@@ -123,7 +124,7 @@ void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
 
 io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
 	for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
-		if (strcmp(current->ident, buf_ident) == 0) {
+		if (current->ident && strcmp(current->ident, buf_ident) == 0) {
 			return current;
 		}
 	}
@@ -215,6 +216,123 @@ char* normalize_path(const char* dir, const char* path) {
 
 	return base;
 }
+
+
+class FileSystem {
+public:
+	using string = frg::string<MemoryAllocator>;
+
+	template <typename T>
+	using entry_map = frg::hash_map<frg::string_view, T, frg::hash<frg::string_view>, MemoryAllocator>;
+
+	struct NoEntry {};
+
+	class File;
+	class Directory;
+
+	class File {
+	public:
+		Directory* parent;
+		string name;
+		io_buf* buf;
+
+	};
+
+	class Directory {
+	public:
+		Directory* parent;
+		string name;
+		entry_map<File*> files{frg::hash<frg::string_view>(), getAllocator()};
+		entry_map<Directory*> dirs{frg::hash<frg::string_view>(), getAllocator()};
+
+		File* create_file(string name) {
+			File* file = static_cast<File*>(getAllocator().allocate(sizeof(File)));
+			::new (file) File{this, std::move(name), nullptr};
+			this->files.insert(file->name, file);
+			return file;
+		}
+
+		Directory* create_dir(string name) {
+			Directory* dir = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
+			::new (dir) Directory{this, std::move(name)};
+			this->dirs.insert(dir->name, dir);
+			return dir;
+		}
+
+		File* create_file(const char* name) {
+			return this->create_file(string{name, getAllocator()});
+		}
+
+		Directory* create_dir(const char* name) {
+			return this->create_dir(string{name, getAllocator()});
+		}
+	};
+
+private:
+	Directory* root;
+
+public:
+	
+	FileSystem() {
+		this->root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
+		::new (this->root) Directory{this->root, {"", getAllocator()}};
+	}
+
+	Directory* get_root() {
+		return this->root;
+	}
+
+	frg::variant<NoEntry, File*, Directory*> find(frg::string_view path, Directory* base = nullptr) {
+		if ((path.size() > 0 && path[0] == '/') || base == nullptr) {
+			base = this->root;
+		}
+		for (size_t i = 0;;) {
+			// skip slashes
+			while (i < path.size() && path[i] == '/') {
+				++i;
+			}
+			// ends with a slash, so is a directory
+			if (i == path.size()) {
+				return base;
+			}
+			// check if special dir
+			if (path[i] == '.') {
+				if (i + 2 < path.size() && path[i + 1] == '.' && path[i + 2] == '/') {
+					base = base->parent;
+					i += 2;
+					continue;
+				}
+				if (i + 1 < path.size() && path[i + 1] == '/') {
+					++i;
+					continue;
+				}
+			}
+			// find 
+			size_t begin = i;
+			while (i < path.size() && path[i] != '/') {
+				++i;
+			}
+			auto sub_path = path.sub_string(begin, i - begin);
+			// can only be file if name goes to the very end
+			if (i == path.size()) {
+				File** file = base->files.get(sub_path);
+				if (file != nullptr) {
+					return *file;
+				}
+			}
+
+			Directory** dir = base->dirs.get(sub_path);
+			if (dir != nullptr) {
+				base = *dir;
+			} else {
+				return NoEntry{};
+			}
+		}
+		// should be unreachable
+		return NoEntry{};
+	}
+
+};
 
 
 class FileTableEntry {
@@ -395,6 +513,24 @@ class FileTable {
 public:
 	FileTable() {
 		test_init_dandelion();
+
+		FileSystem fs;
+		auto* root = fs.get_root();
+		auto* file = root->create_file("hello.txt");
+		auto* dir = root->create_dir("subdir");
+		auto* subfile = dir->create_file("foo.bar");
+
+		auto res0 = fs.find("/hello.txt").get<FileSystem::File*>();
+		auto res1 = fs.find("subdir/foo.bar").get<FileSystem::File*>();
+		auto res2 = fs.find("/subdir/").get<FileSystem::Directory*>();
+		auto res3 = fs.find("/subdir/./../subdir/foo.bar").get<FileSystem::File*>();
+
+		__ensure(res0 == file);
+		__ensure(res1 == subfile);
+		__ensure(res2 == dir);
+		__ensure(res3 == subfile);
+		__ensure(fs.find("nonexistant").is<FileSystem::NoEntry>());
+
 
 		this->working_dir = static_cast<char*>(getAllocator().allocate(2));
 		this->working_dir[0] = '/';
