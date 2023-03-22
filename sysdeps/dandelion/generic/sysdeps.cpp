@@ -15,6 +15,7 @@
 #include <sys/syscall.h>
 #include "cxx-syscall.hpp"
 #include "frg/string.hpp"
+#include "mlibc/posix-sysdeps.hpp"
 
 #include <frg/vector.hpp>
 #include <frg/variant.hpp>
@@ -217,75 +218,144 @@ char* normalize_path(const char* dir, const char* path) {
 	return base;
 }
 
+template <typename T>
+class Refcounted { 
+	size_t refcount{1};
 
-class FileSystem {
 public:
-	using string = frg::string<MemoryAllocator>;
+	void inc_refcount() {
+		this->refcount += 1;
+	}	
 
+	void dec_refcount() {
+		this->refcount -= 1;
+		if (this->refcount == 0) {
+			static_cast<T*>(this)->~T();
+			getAllocator().free(this);
+		}
+	}
+};
+
+struct NoEntry {};
+
+class File : public Refcounted<File> {
+	bool is_static{false};
+
+	std::byte* buf{nullptr};
+	size_t bufsize{0};
+	size_t bufcap{0};
+
+	void ensure_capacity(size_t target) {
+		if (this->bufcap < target) {
+			size_t new_cap = 2 * this->bufcap;
+			if (new_cap < target) {
+				new_cap = target;
+			}
+			std::byte* new_buf = static_cast<std::byte*>(getAllocator().allocate(new_cap));
+			if (this->buf != nullptr) {
+				memcpy(new_buf, this->buf, this->bufsize);
+				getAllocator().free(this->buf);
+			}
+			this->buf = new_buf;
+			this->bufcap = new_cap;
+		}
+	}
+
+public:
+	File() {}
+	File(io_buf* iobuf) : is_static{true}, buf{static_cast<std::byte*>(iobuf->buffer)}, bufsize{iobuf->size} {}
+
+	~File() {
+		if (!is_static) {
+			getAllocator().free(this->buf);
+		}
+	}
+
+	size_t size() const {
+		return this->bufsize;
+	}
+
+	std::byte* buffer() {
+		return this->buf;
+	}
+
+	void truncate(size_t size) {
+		if (size <= this->bufsize) {
+			this->bufsize = size;
+		} else {
+			this->ensure_capacity(size);
+			memset(this->buf + this->bufsize, 0, size - this->bufsize);
+			this->bufsize = size;
+		}
+	}
+
+	int read_offset(void* buffer, size_t size, size_t offset, ssize_t* bytes_read) {
+		size_t to_read = 0;
+		if (offset <= this->bufsize) {
+			to_read = std::min(size, this->bufsize - offset);
+		}
+		memcpy(buffer, this->buf + offset, to_read);
+		*bytes_read = to_read;
+		return 0;
+	}
+
+	int write_offset(const void* buffer, size_t size, size_t offset, ssize_t* bytes_written) {
+		if (this->is_static) {
+			*bytes_written = -1;
+			return EBADF;
+		}
+		size_t required_size = offset + size;
+		ensure_capacity(required_size);
+		if (offset > this->bufsize) {
+			memset(this->buf + this->bufsize, 0, offset - this->bufsize);
+		}
+		memcpy(this->buf + offset, buffer, size);
+		this->bufsize = required_size;
+		*bytes_written = size;
+		return 0;
+	}
+};
+
+using string = frg::string<MemoryAllocator>;
+
+
+class Directory : public Refcounted<Directory> {
 	template <typename T>
-	using entry_map = frg::hash_map<frg::string_view, T, frg::hash<frg::string_view>, MemoryAllocator>;
-
-	struct NoEntry {};
-
-	class File;
-	class Directory;
-
-	class File {
-	public:
-		Directory* parent;
-		string name;
-		io_buf* buf;
-
-	};
-
-	class Directory {
-	public:
-		Directory* parent;
-		string name;
-		entry_map<File*> files{frg::hash<frg::string_view>(), getAllocator()};
-		entry_map<Directory*> dirs{frg::hash<frg::string_view>(), getAllocator()};
-
-		File* create_file(string name) {
-			File* file = static_cast<File*>(getAllocator().allocate(sizeof(File)));
-			::new (file) File{this, std::move(name), nullptr};
-			this->files.insert(file->name, file);
-			return file;
-		}
-
-		Directory* create_dir(string name) {
-			Directory* dir = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
-			::new (dir) Directory{this, std::move(name)};
-			this->dirs.insert(dir->name, dir);
-			return dir;
-		}
-
-		File* create_file(const char* name) {
-			return this->create_file(string{name, getAllocator()});
-		}
-
-		Directory* create_dir(const char* name) {
-			return this->create_dir(string{name, getAllocator()});
-		}
-	};
-
-private:
-	Directory* root;
+	using entry_map = frg::hash_map<string, T, frg::hash<frg::string_view>, MemoryAllocator>;
+	
+	Directory* parent;
+	entry_map<File*> files{frg::hash<frg::string_view>(), getAllocator()};
+	entry_map<Directory*> dirs{frg::hash<frg::string_view>(), getAllocator()};
 
 public:
-	
-	FileSystem() {
-		this->root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
-		::new (this->root) Directory{this->root, {"", getAllocator()}};
+	Directory() : parent{this} {}
+	Directory(Directory* parent) : parent{parent} {}
+
+	File* create_file(string name) {
+		File* file = static_cast<File*>(getAllocator().allocate(sizeof(File)));
+		::new (file) File{};
+		this->files.insert(std::move(name), file);
+		return file;
 	}
 
-	Directory* get_root() {
-		return this->root;
+	Directory* create_dir(string name) {
+		Directory* dir = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
+		::new (dir) Directory{this};
+		this->dirs.insert(std::move(name), dir);
+		return dir;
 	}
 
-	frg::variant<NoEntry, File*, Directory*> find(frg::string_view path, Directory* base = nullptr) {
-		if ((path.size() > 0 && path[0] == '/') || base == nullptr) {
-			base = this->root;
-		}
+	File* create_file(const char* name) {
+		return this->create_file(string{name, getAllocator()});
+	}
+
+	Directory* create_dir(const char* name) {
+		return this->create_dir(string{name, getAllocator()});
+	}
+
+	frg::variant<NoEntry, File*, Directory*> find(frg::string_view path) {
+		Directory* base = this;
+
 		for (size_t i = 0;;) {
 			// skip slashes
 			while (i < path.size() && path[i] == '/') {
@@ -334,12 +404,58 @@ public:
 
 };
 
-
-class FileTableEntry {
-	// internal struct definitions
+class FileSystem {
 public:
-	struct FileData {
-		io_buf* buf;
+	struct NoEntry {};
+private:
+	Directory* root;
+
+	// void add_set_bufs(Directory* dir, io_set& set, int access) {
+	// 	for (auto* buf = set.buf_head; buf != nullptr; buf = buf->next) {
+	// 		if (buf->ident != nullptr) {
+	// 			dir->create_file(buf->ident, buf, access);
+	// 		}
+	// 	}
+	// };
+
+	// void add_sets(io_set& setroot, int access) {
+	// 	add_set_bufs(this->root, setroot, access);
+	// 	for (auto* set = setroot.next; set != nullptr; set = set->next) {
+	// 		if (set->ident != nullptr) {
+	// 			auto* dir = this->root->create_dir(set->ident);
+	// 			add_set_bufs(dir, *set, access);
+	// 		}
+
+	// 	}
+	// }
+
+public:
+	
+	FileSystem() {
+		// init fs root
+		this->root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
+		::new (this->root) Directory{this->root};
+
+		// add_set_bufs(this->root, dandelion.root_input_set, O_RDONLY);
+		// this->add_sets(dandelion.root_input_set, O_RDONLY);
+
+		// add_set_bufs(this->root, dandelion.root_output_set, O_RDWR);
+		// this->add_sets(dandelion.root_output_set, O_RDWR);
+
+	}
+
+	Directory* get_root() {
+		return this->root;
+	}
+
+};
+
+
+class FileTableEntry : public Refcounted<FileTableEntry> {
+	friend class Refcounted<FileTableEntry>;
+public:
+	struct OpenFile {
+		File* data;
 		size_t offset;
 		int flags;
 
@@ -347,61 +463,42 @@ public:
 			return this->flags & 0b11;
 		}
 	};
-	struct DirectoryData {
-		char* path;
+
+	struct OpenDir {
+		Directory* dir;
 	};
 private:
 
-
-	// fields
-	size_t refcount{1};
-	frg::variant<FileData, DirectoryData> data;
+	frg::variant<OpenFile, OpenDir> internal;
 	
 	friend class FileTable;
 	friend void sys_exit(int status);
 
-	FileTableEntry(FileData fdata) : data{std::move(fdata)} {};
-	FileTableEntry(DirectoryData dirdata) : data{std::move(dirdata)} {};
+	FileTableEntry(OpenFile fdata) : internal{std::move(fdata)} {};
+	FileTableEntry(OpenDir dirdata) : internal{std::move(dirdata)} {};
 
 	~FileTableEntry() {
-		// TODO any cleanup
-	}
-
-	void dec_refcount() {
-		this->refcount -= 1;
-		if (this->refcount == 0) {
-			this->~FileTableEntry();
-			getAllocator().free(this);
+		if (this->internal.is<OpenFile>()) {
+			this->internal.get<OpenFile>().data->dec_refcount();
 		}
-	}
-
-	void inc_refcount() {
-		this->refcount += 1;
 	}
 
 public:
 	int read(void* buffer, size_t size, ssize_t* bytes_read) {
-		if (this->data.is<DirectoryData>()) {
+		if (this->internal.is<OpenDir>()) {
 			*bytes_read = -1;
 			return EISDIR;
-		} else if (this->data.is<FileData>()) {
-			FileData& fdata = this->data.get<FileData>();
-			if (!(fdata.access() == O_RDWR || fdata.access() == O_RDONLY)) {
+		} else if (this->internal.is<OpenFile>()) {
+			OpenFile& file = this->internal.get<OpenFile>();
+			if (!(file.access() == O_RDWR || file.access() == O_RDONLY)) {
 				*bytes_read = -1;
 				return EBADF;
 			}
-			if (fdata.buf->buffer == nullptr || fdata.offset >= fdata.buf->size) {
-				*bytes_read = 0;
-				return 0;
+			int code = file.data->read_offset(buffer, size, file.offset, bytes_read);
+			if (code == 0) {
+				file.offset += *bytes_read;
 			}
-			size_t to_read = std::min(size, fdata.buf->size - fdata.offset);
-
-			const void* read_ptr = static_cast<char*>(fdata.buf->buffer) + fdata.offset;
-			memcpy(buffer, read_ptr, to_read);
-
-			*bytes_read = to_read;
-			fdata.offset += to_read;
-			return 0;
+			return code;
 		} else {
 			*bytes_read = -1;
 			mlibc::panicLogger() << "Invalid FileTableEntry type encountered" << frg::endlog;
@@ -410,28 +507,23 @@ public:
 	}
 
 	int write(const void* buffer, size_t size, ssize_t* bytes_written) {
-		if (this->data.is<DirectoryData>()) {
+		if (this->internal.is<OpenDir>()) {
 			*bytes_written = -1;
 			return EISDIR;
-		} else if (this->data.is<FileData>()) {
-			FileData& fdata = this->data.get<FileData>();
-			if (!(fdata.access() == O_RDWR || fdata.access() == O_WRONLY)) {
+		} else if (this->internal.is<OpenFile>()) {
+			OpenFile& file = this->internal.get<OpenFile>();
+			if (!(file.access() == O_RDWR || file.access() == O_WRONLY)) {
 				*bytes_written = -1;
 				return EBADF;
 			}
-			if (fdata.flags & O_APPEND) {
-				fdata.offset = fdata.buf->size;
+			if (file.flags & O_APPEND) {
+				file.offset = file.data->size();
 			}
-			ensure_io_buf_capacity(fdata.buf, fdata.offset + size);
-
-			void* write_ptr = static_cast<char*>(fdata.buf->buffer) + fdata.offset;
-			memcpy(write_ptr, buffer, size);
-			fdata.buf->size = fdata.offset + size;
-
-			*bytes_written = size;
-			fdata.offset += size;
-
-			return 0;
+			int code = file.data->write_offset(buffer, size, file.offset, bytes_written);
+			if (code == 0) {
+				file.offset += *bytes_written;
+			}
+			return code;
 		} else {
 			mlibc::panicLogger() << "Invalid FileTableEntry type encountered" << frg::endlog;
 			return EIO;
@@ -439,18 +531,18 @@ public:
 	}
 
 	int seek(off_t offset, int whence, off_t *new_offset) {
-		if (this->data.is<DirectoryData>()) {
+		if (this->internal.is<OpenDir>()) {
 			*new_offset = -1;
 			// TODO: check: is EISDIR a valid error of seek?
 			return EISDIR;
-		} else if (this->data.is<FileData>()) {
-			FileData& fdata = this->data.get<FileData>();
+		} else if (this->internal.is<OpenFile>()) {
+			OpenFile& openfile = this->internal.get<OpenFile>();
 			if (whence == SEEK_SET && offset >= 0) {
-				fdata.offset = static_cast<size_t>(offset);
-			} else if (whence == SEEK_CUR && (offset >= 0  || (fdata.offset >= static_cast<size_t>(-offset)))) {
-				fdata.offset += offset;
-			} else if (whence == SEEK_END && (offset >= 0 || static_cast<size_t>(-offset) <= fdata.buf->size)) {
-				fdata.offset = fdata.buf->size + offset;
+				openfile.offset = static_cast<size_t>(offset);
+			} else if (whence == SEEK_CUR && (offset >= 0  || (openfile.offset >= static_cast<size_t>(-offset)))) {
+				openfile.offset += offset;
+			} else if (whence == SEEK_END && (offset >= 0 || static_cast<size_t>(-offset) <= openfile.data->size())) {
+				openfile.offset = openfile.data->size() + offset;
 			} else {
 				*new_offset = -1;
 				return EINVAL;
@@ -462,16 +554,16 @@ public:
 		}
 	}
 
-	const io_buf* get_io_buf() {
-		if (this->data.is<FileData>()) {
-			return this->data.get<FileData>().buf;
+	File* get_file() {
+		if (this->internal.is<OpenFile>()) {
+			return this->internal.get<OpenFile>().data;
 		}
 		return nullptr;
 	}
 
-	const char* get_dirpath() {
-		if (this->data.is<DirectoryData>()) {
-			return this->data.get<DirectoryData>().path;
+	Directory* get_dir() {
+		if (this->internal.is<OpenDir>()) {
+			return this->internal.get<OpenDir>().dir;
 		}
 		return nullptr;
 	}
@@ -479,8 +571,8 @@ public:
 
 class FileTable {
 	frg::vector<FileTableEntry*, MemoryAllocator> open_files{getAllocator()};
-	io_set tempfiles{nullptr, nullptr, nullptr};
-	char* working_dir{nullptr};
+	Directory* working_dir;
+	Directory* fs_root;
 
 	int find_free_slot() {
 		for (size_t i = 0; i < open_files.size(); ++i) {
@@ -512,49 +604,38 @@ class FileTable {
 
 public:
 	FileTable() {
-		test_init_dandelion();
+		// TODO working dir also needs to deal with refcounts.
+		this->fs_root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
+		::new (this->fs_root) Directory{this->fs_root};
+		this->working_dir = this->fs_root;
 
-		FileSystem fs;
-		auto* root = fs.get_root();
-		auto* file = root->create_file("hello.txt");
-		auto* dir = root->create_dir("subdir");
-		auto* subfile = dir->create_file("foo.bar");
+		// test_init_dandelion();
 
-		auto res0 = fs.find("/hello.txt").get<FileSystem::File*>();
-		auto res1 = fs.find("subdir/foo.bar").get<FileSystem::File*>();
-		auto res2 = fs.find("/subdir/").get<FileSystem::Directory*>();
-		auto res3 = fs.find("/subdir/./../subdir/foo.bar").get<FileSystem::File*>();
+		File* stdin = static_cast<File*>(getAllocator().allocate(sizeof(File)));
+		::new (stdin) File{};
 
-		__ensure(res0 == file);
-		__ensure(res1 == subfile);
-		__ensure(res2 == dir);
-		__ensure(res3 == subfile);
-		__ensure(fs.find("nonexistant").is<FileSystem::NoEntry>());
+		File* stdout = static_cast<File*>(getAllocator().allocate(sizeof(File)));
+		::new (stdout) File{};
 
-
-		this->working_dir = static_cast<char*>(getAllocator().allocate(2));
-		this->working_dir[0] = '/';
-		this->working_dir[1] = '\0';
-
-		init_io_buf(&dandelion.stdout, nullptr, nullptr);
-		init_io_buf(&dandelion.stderr, nullptr, nullptr);
+		File* stderr = static_cast<File*>(getAllocator().allocate(sizeof(File)));
+		::new (stderr) File{};
 
 		auto* stdin_file = this->create_entry(
-			FileTableEntry::FileData {
-				&dandelion.stdin,
+			FileTableEntry::OpenFile {
+				stdin,
 				0,
 				O_RDONLY
 		});
 
 		auto* stdout_file = this->create_entry(
-			FileTableEntry::FileData {
-				&dandelion.stdout,
+			FileTableEntry::OpenFile {
+				stdout,
 				0,
 				O_WRONLY
 		});
 		auto* stderr_file = this->create_entry(
-			FileTableEntry::FileData {
-				&dandelion.stderr,
+			FileTableEntry::OpenFile {
+				stderr,
 				0,
 				O_WRONLY
 		});
@@ -563,109 +644,111 @@ public:
 		this->open_files.push_back(stderr_file);
 
 		// TESTING
-		__ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
-		__ensure(!strcmp(normalize_path("/hello/.loca/", "../testpath/./../end/./file.txt"), "/hello/end/file.txt"));
-		add_buf_to_set(&dandelion.root_output_set, "hello.txt");
+		// __ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
+		// __ensure(!strcmp(normalize_path("/hello/.loca/", "../testpath/./../end/./file.txt"), "/hello/end/file.txt"));
+		// add_buf_to_set(&dandelion.root_output_set, "hello.txt");
 	}
 
 	int set_cwd(const char* path) {
-		size_t newpathlen = strlen(path);
-		size_t cwdlen = strlen(this->working_dir);
-		if (newpathlen <= cwdlen) {
-			strcpy(this->working_dir, path);
-		}
 		return 0;
 	}
 
 	const char* get_cwd() const {
-		return this->working_dir;
+		return nullptr;
 	}
 
-	int open_normalized(const char* normpath, int flags, int* fd) {
+	int open(const char* path, int flags, int* fd) {
+		return this->openat(AT_FDCWD, path, flags, fd);
+	}
+
+	int openat(int dirfd, const char* path, int flags, int* fd) {
+		Directory* base;
+		if (dirfd == AT_FDCWD) {
+			base = this->working_dir;
+		} else if (path[0] == '/') {
+			base = this->fs_root;
+		} else {
+			auto* entry = this->get(dirfd);
+			if (entry == nullptr) {
+				*fd = -1;
+				return EBADF;
+			}
+			base = entry->get_dir();
+			if (base == nullptr) {
+				*fd = -1;
+				return ENOTDIR;
+			}
+		}
 
 		int access = flags & 0b11;
-		
-		// look in root input set
-		// use normpath + 1 to skip initial '/' char
-		auto* buf = find_buf_in_set(&dandelion.root_input_set, normpath + 1);
-		// if found, assert that access flags are readonly
-		if (buf && access != O_RDONLY) {
-			*fd = -1;
-			return EACCES;
-		}
 
-		// if not found in root input, look in root output
-		if (!buf) {
-			// use normpath + 1 to skip initial '/' char
-			buf = find_buf_in_set(&dandelion.root_output_set, normpath + 1);
-		}
-		
-		// TODO: search through other sets
+		auto res = base->find(path);
 
-		// if not found in either, we're dealing with a temporary file
-		if (!buf) {
-			buf = find_buf_in_set(&this->tempfiles, normpath);
-		}
+		if (res.is<Directory*>()) {
+			auto* dir = res.get<Directory*>();
 
-		// check if the file exists even though we're trying to open exclusively
-		if (buf && (flags & O_CREAT) && (flags & O_EXCL)) {
-			*fd = -1;
-			return EEXIST;
-		}
+			dir->inc_refcount();
+			int slot = this->find_free_slot();
+			this->open_files[slot] = this->create_entry(
+				FileTableEntry::OpenDir{dir}
+			);
+			*fd = slot;
+			return 0;
+		} 
 
-		// if we couldn't find the temporary file, create one
-		if (!buf && (flags & O_CREAT)) {
-			buf = add_buf_to_set(&this->tempfiles, normpath);
-		}
+		File* file = nullptr;
+		if (res.is<File*>()) {
+			file = res.get<File*>();
 
-		if (!buf) {
-			*fd = -1;
-			return EACCES;
+			if ((flags & O_CREAT) && (flags & O_EXCL)) {
+				*fd = -1;
+				return EEXIST;
+			}
+
+
+		} else if (res.is<NoEntry>()) {
+			if (!(flags & O_CREAT)) {
+				*fd = -1;
+				return EACCES;
+			}
+
+			// get directory name
+			size_t dirname_len = strlen(path);
+			while (dirname_len > 0 && path[dirname_len - 1] != '/') {
+				--dirname_len;
+			}
+
+			Directory* loc = base;
+			if (dirname_len > 0) {
+				auto res = base->find(frg::string_view{path, dirname_len});
+				if (res.is<Directory*>()) {
+					loc = res.get<Directory*>();
+				} else {
+					*fd = -1;
+					return EINVAL;
+				}
+			}
+
+			file = loc->create_file(path + dirname_len);
 		}
 
 		// if we're opening in truncation mode, set the size of the file to 0
 		// note that this doesn't actually modify the file buffer
 		if ((flags & O_TRUNC) && (access == O_RDWR || access == O_WRONLY)) {
-			buf->size = 0;
+			file->truncate(0);
 		}
 
+		file->inc_refcount();
 		int slot = this->find_free_slot();
 		this->open_files[slot] = this->create_entry(
-			FileTableEntry::FileData {
-				buf,
-				flags & O_APPEND ? buf->size : 0,
+			FileTableEntry::OpenFile {
+				file,
+				flags & O_APPEND ? file->size() : 0,
 				flags,
 			}
 		);
 		*fd = slot;
 		return 0;
-	}
-
-	int open(const char* path, int flags, int* fd) {
-		char* normpath = normalize_path(this->working_dir, path);
-		int code = this->open_normalized(normpath, flags, fd);
-		getAllocator().free(normpath);
-		return code;
-	}
-
-	int openat(int dirfd, const char* path, int flags, int* fd) {
-		if (dirfd == AT_FDCWD) {
-			return this->open(path, flags, fd);
-		}
-		auto* entry = this->get(dirfd);
-		if (entry == nullptr) {
-			*fd = -1;
-			return EBADF;
-		}
-		const char* dirpath = entry->get_dirpath();
-		if (dirpath == nullptr) {
-			*fd = -1;
-			return EBADF;
-		}
-		char* normpath = normalize_path(dirpath, path);
-		int code = this->open_normalized(normpath, flags, fd);
-		getAllocator().free(normpath);
-		return code;
 	}
 
 	FileTableEntry* get(int fd) {
@@ -1664,7 +1747,8 @@ void sys_thread_exit() {
 
 void sys_exit(int status) {
 	ssize_t written;
-	sys_write_old(1, dandelion.stdout.buffer, dandelion.stdout.size, &written);
+	auto& f = *vfs::get_file_table().get(1)->get_file();
+	sys_write_old(1, f.buffer(), f.size(), &written);
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
@@ -1756,15 +1840,16 @@ int sys_chdir(const char *path) {
 }
 
 int sys_fchdir(int fd) {
-	auto* entry = vfs::get_file_table().get(fd);
-	if (entry == nullptr) {
-		return EBADF;
-	}
-	auto* path = entry->get_dirpath();
-	if (path == nullptr) {
-		return ENOTDIR;
-	}
-	return sys_chdir(path);
+	return EBADF;
+	// auto* entry = vfs::get_file_table().get(fd);
+	// if (entry == nullptr) {
+	// 	return EBADF;
+	// }
+	// auto* path = entry->get_dirpath();
+	// if (path == nullptr) {
+	// 	return ENOTDIR;
+	// }
+	// return sys_chdir(path);
 }
 
 int sys_rename(const char *old_path, const char *new_path) {
