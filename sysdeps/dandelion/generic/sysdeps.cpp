@@ -111,18 +111,6 @@ void init_io_buf(io_buf* buf, const char* ident, io_buf* next) {
 	buf->capacity = initial_bufsize;
 }
 
-void ensure_io_buf_capacity(io_buf* buf, size_t min_capacity) {
-	if (buf->capacity < min_capacity) {
-		size_t new_capacity = 2 * buf->capacity;
-		void* new_buf = getAllocator().allocate(new_capacity);
-		if (buf->size > 0) {
-			memcpy(new_buf, buf->buffer, buf->size);
-		}
-		buf->buffer = new_buf;
-		buf->capacity = new_capacity;
-	}
-}
-
 io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
 	for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
 		if (current->ident && strcmp(current->ident, buf_ident) == 0) {
@@ -349,7 +337,15 @@ public:
 		return this->create_file(string{name, getAllocator()});
 	}
 
+	File* create_file(frg::string_view name) {
+		return this->create_file(string{name, getAllocator()});
+	}
+
 	Directory* create_dir(const char* name) {
+		return this->create_dir(string{name, getAllocator()});
+	}
+
+	Directory* create_dir(frg::string_view name) {
 		return this->create_dir(string{name, getAllocator()});
 	}
 
@@ -404,51 +400,30 @@ public:
 
 };
 
-class FileSystem {
-public:
-	struct NoEntry {};
-private:
-	Directory* root;
+// void add_set_bufs(Directory* dir, io_set& set, int access) {
+// 	for (auto* buf = set.buf_head; buf != nullptr; buf = buf->next) {
+// 		if (buf->ident != nullptr) {
+// 			dir->create_file(buf->ident, buf, access);
+// 		}
+// 	}
+// };
 
-	// void add_set_bufs(Directory* dir, io_set& set, int access) {
-	// 	for (auto* buf = set.buf_head; buf != nullptr; buf = buf->next) {
-	// 		if (buf->ident != nullptr) {
-	// 			dir->create_file(buf->ident, buf, access);
-	// 		}
-	// 	}
-	// };
+// void add_sets(io_set& setroot, int access) {
+// 	add_set_bufs(this->root, setroot, access);
+// 	for (auto* set = setroot.next; set != nullptr; set = set->next) {
+// 		if (set->ident != nullptr) {
+// 			auto* dir = this->root->create_dir(set->ident);
+// 			add_set_bufs(dir, *set, access);
+// 		}
 
-	// void add_sets(io_set& setroot, int access) {
-	// 	add_set_bufs(this->root, setroot, access);
-	// 	for (auto* set = setroot.next; set != nullptr; set = set->next) {
-	// 		if (set->ident != nullptr) {
-	// 			auto* dir = this->root->create_dir(set->ident);
-	// 			add_set_bufs(dir, *set, access);
-	// 		}
+// 	}
+// }
 
-	// 	}
-	// }
+// add_set_bufs(this->root, dandelion.root_input_set, O_RDONLY);
+// this->add_sets(dandelion.root_input_set, O_RDONLY);
 
-public:
-	
-	FileSystem() {
-		// init fs root
-		this->root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
-		::new (this->root) Directory{this->root};
-
-		// add_set_bufs(this->root, dandelion.root_input_set, O_RDONLY);
-		// this->add_sets(dandelion.root_input_set, O_RDONLY);
-
-		// add_set_bufs(this->root, dandelion.root_output_set, O_RDWR);
-		// this->add_sets(dandelion.root_output_set, O_RDWR);
-
-	}
-
-	Directory* get_root() {
-		return this->root;
-	}
-
-};
+// add_set_bufs(this->root, dandelion.root_output_set, O_RDWR);
+// this->add_sets(dandelion.root_output_set, O_RDWR);
 
 
 class FileTableEntry : public Refcounted<FileTableEntry> {
@@ -480,6 +455,8 @@ private:
 	~FileTableEntry() {
 		if (this->internal.is<OpenFile>()) {
 			this->internal.get<OpenFile>().data->dec_refcount();
+		} else if (this->internal.is<OpenDir>()) {
+			this->internal.get<OpenDir>().dir->dec_refcount();
 		}
 	}
 
@@ -569,6 +546,22 @@ public:
 	}
 };
 
+frg::string_view path_filename(const char* path) {
+	size_t dirname_len = strlen(path);
+	while (dirname_len > 0 && path[dirname_len - 1] != '/') {
+		--dirname_len;
+	}
+	return {path + dirname_len};
+}
+
+frg::string_view path_dirname(const char* path) {
+	size_t dirname_len = strlen(path);
+	while (dirname_len > 0 && path[dirname_len - 1] != '/') {
+		--dirname_len;
+	}
+	return {path, dirname_len};
+}
+
 class FileTable {
 	frg::vector<FileTableEntry*, MemoryAllocator> open_files{getAllocator()};
 	Directory* working_dir;
@@ -600,6 +593,25 @@ class FileTable {
 		void* mem = getAllocator().allocate(sizeof(FileTableEntry));
 		new (mem) FileTableEntry{std::forward<decltype(args)...>(args...)};
 		return static_cast<FileTableEntry*>(mem);
+	}
+
+	Directory* get_base(int dirfd, const char* path) {
+		Directory* base;
+		if (dirfd == AT_FDCWD) {
+			base = this->working_dir;
+		} else if (path[0] == '/') {
+			base = this->fs_root;
+		} else {
+			auto* entry = this->get(dirfd);
+			if (entry == nullptr) {
+				return nullptr;
+			}
+			base = entry->get_dir();
+			if (base == nullptr) {
+				return nullptr;
+			}
+		}
+		return base;
 	}
 
 public:
@@ -657,28 +669,8 @@ public:
 		return nullptr;
 	}
 
-	int open(const char* path, int flags, int* fd) {
-		return this->openat(AT_FDCWD, path, flags, fd);
-	}
-
 	int openat(int dirfd, const char* path, int flags, int* fd) {
-		Directory* base;
-		if (dirfd == AT_FDCWD) {
-			base = this->working_dir;
-		} else if (path[0] == '/') {
-			base = this->fs_root;
-		} else {
-			auto* entry = this->get(dirfd);
-			if (entry == nullptr) {
-				*fd = -1;
-				return EBADF;
-			}
-			base = entry->get_dir();
-			if (base == nullptr) {
-				*fd = -1;
-				return ENOTDIR;
-			}
-		}
+		auto* base = this->get_base(dirfd, path);
 
 		int access = flags & 0b11;
 
@@ -712,15 +704,10 @@ public:
 				return EACCES;
 			}
 
-			// get directory name
-			size_t dirname_len = strlen(path);
-			while (dirname_len > 0 && path[dirname_len - 1] != '/') {
-				--dirname_len;
-			}
-
+			auto dirname = path_dirname(path);
 			Directory* loc = base;
-			if (dirname_len > 0) {
-				auto res = base->find(frg::string_view{path, dirname_len});
+			if (dirname.size() > 0) {
+				auto res = base->find(dirname);
 				if (res.is<Directory*>()) {
 					loc = res.get<Directory*>();
 				} else {
@@ -729,7 +716,7 @@ public:
 				}
 			}
 
-			file = loc->create_file(path + dirname_len);
+			file = loc->create_file(path_filename(path));
 		}
 
 		// if we're opening in truncation mode, set the size of the file to 0
@@ -749,6 +736,22 @@ public:
 		);
 		*fd = slot;
 		return 0;
+	}
+
+	int mkdirat(int dirfd, const char* path) {
+		auto* base = this->get_base(dirfd, path);
+		auto loc = base->find(path_dirname(path));
+		if (loc.is<Directory*>()) {
+			Directory* locdir = loc.get<Directory*>();
+			// TODO remove trailing slash from pathname
+			// TODO check that filename isn't empty
+			// TODO chck if exists 
+			locdir->create_dir(path_filename(path));
+			return 0;
+		} else {
+			// TODO correct error code
+			return ENOTDIR;
+		}
 	}
 
 	FileTableEntry* get(int fd) {
@@ -849,7 +852,7 @@ int sys_fadvise(int fd, off_t offset, off_t length, int advice) {
 
 int sys_open(const char *path, int flags, mode_t mode, int *fd) {
 	(void)mode;
-	return vfs::get_file_table().open(path, flags, fd);
+	return vfs::get_file_table().openat(AT_FDCWD, path, flags, fd);
 }
 
 int sys_openat(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
@@ -1790,18 +1793,14 @@ int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
 }
 
 int sys_mkdir(const char *path, mode_t mode) {
-	auto ret = do_syscall(SYS_mkdirat, AT_FDCWD, path, mode);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)mode;
+	return vfs::get_file_table().mkdirat(AT_FDCWD, path);
 }
 
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
-	auto ret = do_syscall(SYS_mkdirat, dirfd, path, mode);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)mode;
+	return vfs::get_file_table().mkdirat(dirfd, path);
 }
 
 int sys_mknodat(int dirfd, const char *path, int mode, int dev) {
