@@ -16,6 +16,7 @@
 #include "cxx-syscall.hpp"
 #include "frg/string.hpp"
 #include "mlibc/posix-sysdeps.hpp"
+#include "refcounted.hpp"
 
 #include <frg/vector.hpp>
 #include <frg/variant.hpp>
@@ -211,6 +212,7 @@ class Refcounted {
 	size_t refcount{1};
 
 public:
+
 	void inc_refcount() {
 		this->refcount += 1;
 	}	
