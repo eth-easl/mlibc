@@ -207,28 +207,9 @@ char* normalize_path(const char* dir, const char* path) {
 	return base;
 }
 
-template <typename T>
-class Refcounted { 
-	size_t refcount{1};
-
-public:
-
-	void inc_refcount() {
-		this->refcount += 1;
-	}	
-
-	void dec_refcount() {
-		this->refcount -= 1;
-		if (this->refcount == 0) {
-			static_cast<T*>(this)->~T();
-			getAllocator().free(this);
-		}
-	}
-};
-
 struct NoEntry {};
 
-class File : public Refcounted<File> {
+class File {
 	bool is_static{false};
 
 	std::byte* buf{nullptr};
@@ -309,51 +290,31 @@ public:
 using string = frg::string<MemoryAllocator>;
 
 
-class Directory : public Refcounted<Directory> {
+class Directory {
 	template <typename T>
 	using entry_map = frg::hash_map<string, T, frg::hash<frg::string_view>, MemoryAllocator>;
 	
 	Directory* parent;
-	entry_map<File*> files{frg::hash<frg::string_view>(), getAllocator()};
-	entry_map<Directory*> dirs{frg::hash<frg::string_view>(), getAllocator()};
+	entry_map<Rc<File>> files{frg::hash<frg::string_view>(), getAllocator()};
+	entry_map<Rc<Directory>> dirs{frg::hash<frg::string_view>(), getAllocator()};
 
 public:
 	Directory() : parent{this} {}
 	Directory(Directory* parent) : parent{parent} {}
 
-	File* create_file(string name) {
-		File* file = static_cast<File*>(getAllocator().allocate(sizeof(File)));
-		::new (file) File{};
-		this->files.insert(std::move(name), file);
+	Rc<File> create_file(auto name) {
+		auto file = Rc<File>::make();
+		this->files.insert(string{std::move(name), getAllocator()}, file);
 		return file;
 	}
 
-	Directory* create_dir(string name) {
-		Directory* dir = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
-		::new (dir) Directory{this};
-		this->dirs.insert(std::move(name), dir);
+	Rc<Directory> create_dir(auto name) {
+		auto dir = Rc<Directory>::make(this);
+		this->dirs.insert(string{std::move(name), getAllocator()}, dir);
 		return dir;
 	}
 
-	File* create_file(const char* name) {
-		return this->create_file(string{name, getAllocator()});
-	}
-
-	File* create_file(frg::string_view name) {
-		return this->create_file(string{name, getAllocator()});
-	}
-
-	Directory* create_dir(const char* name) {
-		return this->create_dir(string{name, getAllocator()});
-	}
-
-	Directory* create_dir(frg::string_view name) {
-		return this->create_dir(string{name, getAllocator()});
-	}
-
-	frg::variant<NoEntry, File*, Directory*> find(frg::string_view path) {
-		Directory* base = this;
-
+	static frg::variant<NoEntry, Rc<File>, Rc<Directory>> find(Rc<Directory> base, frg::string_view path) {
 		for (size_t i = 0;;) {
 			// skip slashes
 			while (i < path.size() && path[i] == '/') {
@@ -428,11 +389,10 @@ public:
 // this->add_sets(dandelion.root_output_set, O_RDWR);
 
 
-class FileTableEntry : public Refcounted<FileTableEntry> {
-	friend class Refcounted<FileTableEntry>;
+class FileTableEntry {
 public:
 	struct OpenFile {
-		File* data;
+		Rc<File> data;
 		size_t offset;
 		int flags;
 
@@ -442,7 +402,7 @@ public:
 	};
 
 	struct OpenDir {
-		Directory* dir;
+		Rc<Directory> dir;
 	};
 private:
 
@@ -453,14 +413,6 @@ private:
 
 	FileTableEntry(OpenFile fdata) : internal{std::move(fdata)} {};
 	FileTableEntry(OpenDir dirdata) : internal{std::move(dirdata)} {};
-
-	~FileTableEntry() {
-		if (this->internal.is<OpenFile>()) {
-			this->internal.get<OpenFile>().data->dec_refcount();
-		} else if (this->internal.is<OpenDir>()) {
-			this->internal.get<OpenDir>().dir->dec_refcount();
-		}
-	}
 
 public:
 	int read(void* buffer, size_t size, ssize_t* bytes_read) {
@@ -535,14 +487,14 @@ public:
 
 	File* get_file() {
 		if (this->internal.is<OpenFile>()) {
-			return this->internal.get<OpenFile>().data;
+			return this->internal.get<OpenFile>().data.get();
 		}
 		return nullptr;
 	}
 
 	Directory* get_dir() {
 		if (this->internal.is<OpenDir>()) {
-			return this->internal.get<OpenDir>().dir;
+			return this->internal.get<OpenDir>().dir.get();
 		}
 		return nullptr;
 	}
@@ -565,9 +517,9 @@ frg::string_view path_dirname(const char* path) {
 }
 
 class FileTable {
-	frg::vector<FileTableEntry*, MemoryAllocator> open_files{getAllocator()};
-	Directory* working_dir;
-	Directory* fs_root;
+	frg::vector<Rc<FileTableEntry>, MemoryAllocator> open_files{getAllocator()};
+	Rc<Directory> working_dir;
+	Rc<Directory> fs_root;
 
 	int find_free_slot() {
 		for (size_t i = 0; i < open_files.size(); ++i) {
@@ -591,18 +543,24 @@ class FileTable {
 		return 0;
 	}
 
-	FileTableEntry* create_entry(auto&&... args) {
-		void* mem = getAllocator().allocate(sizeof(FileTableEntry));
-		new (mem) FileTableEntry{std::forward<decltype(args)...>(args...)};
-		return static_cast<FileTableEntry*>(mem);
+	void set_entry_at(size_t idx, Rc<FileTableEntry> entry) {
+		this->open_files[idx] = std::move(entry);
+	}
+
+	void create_entry_at(size_t idx, auto&&... args) {
+		if (this->open_files.size() < idx + 1) {
+			this->open_files.resize(idx + 1);
+		}
+		auto entry = Rc<FileTableEntry>::make(std::forward<decltype(args)...>(args...));
+		this->open_files[idx] = std::move(entry);
 	}
 
 	Directory* get_base(int dirfd, const char* path) {
 		Directory* base;
 		if (dirfd == AT_FDCWD) {
-			base = this->working_dir;
+			base = this->working_dir.get();
 		} else if (path[0] == '/') {
-			base = this->fs_root;
+			base = this->fs_root.get();
 		} else {
 			auto* entry = this->get(dirfd);
 			if (entry == nullptr) {
@@ -618,44 +576,31 @@ class FileTable {
 
 public:
 	FileTable() {
-		// TODO working dir also needs to deal with refcounts.
-		this->fs_root = static_cast<Directory*>(getAllocator().allocate(sizeof(Directory)));
-		::new (this->fs_root) Directory{this->fs_root};
-		this->working_dir = this->fs_root;
-
 		// test_init_dandelion();
 
-		File* stdin = static_cast<File*>(getAllocator().allocate(sizeof(File)));
-		::new (stdin) File{};
+		this->fs_root = Rc<Directory>::make();
+		this->working_dir = this->fs_root;
 
-		File* stdout = static_cast<File*>(getAllocator().allocate(sizeof(File)));
-		::new (stdout) File{};
 
-		File* stderr = static_cast<File*>(getAllocator().allocate(sizeof(File)));
-		::new (stderr) File{};
-
-		auto* stdin_file = this->create_entry(
+		this->create_entry_at(0,
 			FileTableEntry::OpenFile {
-				stdin,
+				Rc<File>::make(),
 				0,
 				O_RDONLY
 		});
 
-		auto* stdout_file = this->create_entry(
+		this->create_entry_at(1,
 			FileTableEntry::OpenFile {
-				stdout,
+				Rc<File>::make(),
 				0,
 				O_WRONLY
 		});
-		auto* stderr_file = this->create_entry(
+		this->create_entry_at(2,
 			FileTableEntry::OpenFile {
-				stderr,
+				Rc<File>::make(),
 				0,
 				O_WRONLY
 		});
-		this->open_files.push_back(stdin_file);
-		this->open_files.push_back(stdout_file);
-		this->open_files.push_back(stderr_file);
 
 		// TESTING
 		// __ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
@@ -756,7 +701,7 @@ public:
 		}
 	}
 
-	FileTableEntry* get(int fd) {
+	Rc<FileTableEntry> get(int fd) {
 		if (check_fd(fd)) {
 			return nullptr;
 		}
@@ -767,14 +712,12 @@ public:
 		if (srcfd == targetfd) {
 			return 0;
 		}
-		FileTableEntry* source = this->get(srcfd);
+		auto source = this->get(srcfd);
 		if (source == nullptr) {
 			return EBADF;
 		}
 		this->close(targetfd);
-		this->ensure_slot(targetfd);
-		this->open_files[targetfd] = source;
-		source->inc_refcount();
+		this->set_entry_at(targetfd, source);
 		return 0;
 	}
 
@@ -788,8 +731,7 @@ public:
 	}
 
 	int close(int fd) {
-		if (FileTableEntry* target = this->get(fd); target) {
-			target->dec_refcount();
+		if (fd <= 0 && static_cast<size_t>(fd) < this->open_files.size()) {
 			this->open_files[fd] = nullptr;
 			return 0;
 		}
@@ -872,7 +814,7 @@ int sys_dup2(int fd, int flags, int newfd) {
 }
 
 int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
-	auto* file = vfs::get_file_table().get(fd);
+	auto file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}

@@ -66,12 +66,16 @@ public:
         return *this;
     }
 
+    T* get() const {
+        return &ptr->value;
+    }
+
     T& operator*() {
         return ptr->value;
     }
 
     T* operator->() {
-        return &ptr->value;
+        return this->get();
     }
 
     bool operator==(const Rc& other) const {
