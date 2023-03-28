@@ -294,13 +294,13 @@ class Directory {
 	template <typename T>
 	using entry_map = frg::hash_map<string, T, frg::hash<frg::string_view>, MemoryAllocator>;
 	
-	Directory* parent;
+	Rc<Directory> parent;
 	entry_map<Rc<File>> files{frg::hash<frg::string_view>(), getAllocator()};
 	entry_map<Rc<Directory>> dirs{frg::hash<frg::string_view>(), getAllocator()};
 
 public:
-	Directory() : parent{this} {}
-	Directory(Directory* parent) : parent{parent} {}
+	// Directory() : parent{this} {}
+	Directory(Rc<Directory> parent) : parent{parent} {}
 
 	Rc<File> create_file(auto name) {
 		auto file = Rc<File>::make();
@@ -344,13 +344,13 @@ public:
 			auto sub_path = path.sub_string(begin, i - begin);
 			// can only be file if name goes to the very end
 			if (i == path.size()) {
-				File** file = base->files.get(sub_path);
+				Rc<File>* file = base->files.get(sub_path);
 				if (file != nullptr) {
 					return *file;
 				}
 			}
 
-			Directory** dir = base->dirs.get(sub_path);
+			Rc<Directory>* dir = base->dirs.get(sub_path);
 			if (dir != nullptr) {
 				base = *dir;
 			} else {
@@ -485,16 +485,16 @@ public:
 		}
 	}
 
-	File* get_file() {
+	Rc<File> get_file() {
 		if (this->internal.is<OpenFile>()) {
-			return this->internal.get<OpenFile>().data.get();
+			return this->internal.get<OpenFile>().data;
 		}
 		return nullptr;
 	}
 
-	Directory* get_dir() {
+	Rc<Directory> get_dir() {
 		if (this->internal.is<OpenDir>()) {
-			return this->internal.get<OpenDir>().dir.get();
+			return this->internal.get<OpenDir>().dir;
 		}
 		return nullptr;
 	}
@@ -521,7 +521,7 @@ class FileTable {
 	Rc<Directory> working_dir;
 	Rc<Directory> fs_root;
 
-	int find_free_slot() {
+	size_t find_free_slot() {
 		for (size_t i = 0; i < open_files.size(); ++i) {
 			if (open_files[i] == nullptr) {
 				return i;
@@ -547,6 +547,12 @@ class FileTable {
 		this->open_files[idx] = std::move(entry);
 	}
 
+	int create_entry(auto&&... args) {
+		size_t idx = this->find_free_slot();
+		this->create_entry_at(idx, std::forward<decltype(args)...>(args...));
+		return static_cast<int>(idx);
+	}
+
 	void create_entry_at(size_t idx, auto&&... args) {
 		if (this->open_files.size() < idx + 1) {
 			this->open_files.resize(idx + 1);
@@ -555,14 +561,14 @@ class FileTable {
 		this->open_files[idx] = std::move(entry);
 	}
 
-	Directory* get_base(int dirfd, const char* path) {
-		Directory* base;
+	Rc<Directory> get_base(int dirfd, const char* path) {
+		Rc<Directory> base;
 		if (dirfd == AT_FDCWD) {
-			base = this->working_dir.get();
+			base = this->working_dir;
 		} else if (path[0] == '/') {
-			base = this->fs_root.get();
+			base = this->fs_root;
 		} else {
-			auto* entry = this->get(dirfd);
+			auto entry = this->get(dirfd);
 			if (entry == nullptr) {
 				return nullptr;
 			}
@@ -617,34 +623,27 @@ public:
 	}
 
 	int openat(int dirfd, const char* path, int flags, int* fd) {
-		auto* base = this->get_base(dirfd, path);
+		auto base = this->get_base(dirfd, path);
 
 		int access = flags & 0b11;
 
-		auto res = base->find(path);
+		auto res = Directory::find(base, path);
 
-		if (res.is<Directory*>()) {
-			auto* dir = res.get<Directory*>();
+		if (res.is<Rc<Directory>>()) {
+			auto dir = res.get<Rc<Directory>>();
 
-			dir->inc_refcount();
-			int slot = this->find_free_slot();
-			this->open_files[slot] = this->create_entry(
-				FileTableEntry::OpenDir{dir}
-			);
-			*fd = slot;
+			*fd = this->create_entry(FileTableEntry::OpenDir{dir});
 			return 0;
 		} 
 
-		File* file = nullptr;
-		if (res.is<File*>()) {
-			file = res.get<File*>();
+		Rc<File> file;
+		if (res.is<Rc<File>>()) {
+			file = res.get<Rc<File>>();
 
 			if ((flags & O_CREAT) && (flags & O_EXCL)) {
 				*fd = -1;
 				return EEXIST;
 			}
-
-
 		} else if (res.is<NoEntry>()) {
 			if (!(flags & O_CREAT)) {
 				*fd = -1;
@@ -652,11 +651,11 @@ public:
 			}
 
 			auto dirname = path_dirname(path);
-			Directory* loc = base;
+			Rc<Directory> loc = base;
 			if (dirname.size() > 0) {
-				auto res = base->find(dirname);
-				if (res.is<Directory*>()) {
-					loc = res.get<Directory*>();
+				auto res = Directory::find(base, dirname);
+				if (res.is<Rc<Directory>>()) {
+					loc = res.get<Rc<Directory>>();
 				} else {
 					*fd = -1;
 					return EINVAL;
@@ -672,24 +671,22 @@ public:
 			file->truncate(0);
 		}
 
-		file->inc_refcount();
-		int slot = this->find_free_slot();
-		this->open_files[slot] = this->create_entry(
+		*fd = this->create_entry(
 			FileTableEntry::OpenFile {
 				file,
 				flags & O_APPEND ? file->size() : 0,
 				flags,
 			}
 		);
-		*fd = slot;
+
 		return 0;
 	}
 
 	int mkdirat(int dirfd, const char* path) {
-		auto* base = this->get_base(dirfd, path);
-		auto loc = base->find(path_dirname(path));
-		if (loc.is<Directory*>()) {
-			Directory* locdir = loc.get<Directory*>();
+		auto base = this->get_base(dirfd, path);
+		auto loc = Directory::find(base, path_dirname(path));
+		if (loc.is<Rc<Directory>>()) {
+			auto locdir = loc.get<Rc<Directory>>();
 			// TODO remove trailing slash from pathname
 			// TODO check that filename isn't empty
 			// TODO chck if exists 
@@ -830,7 +827,7 @@ int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 }
 
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	auto* file = vfs::get_file_table().get(fd);
+	auto file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
@@ -846,7 +843,7 @@ int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_writte
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
-	auto* file = vfs::get_file_table().get(fd);
+	auto file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
