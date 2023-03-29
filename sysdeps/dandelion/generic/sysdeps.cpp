@@ -245,7 +245,6 @@ public:
 
 using string = frg::string<MemoryAllocator>;
 
-
 class Directory {
 	template <typename T>
 	using entry_map = frg::hash_map<string, T, frg::hash<frg::string_view>, MemoryAllocator>;
@@ -262,6 +261,10 @@ public:
 		this->parent = parent;
 	}
 
+	bool is_empty() {
+		return this->files.empty() && this->dirs.empty();
+	}
+
 	static Rc<File> create_file(Rc<Directory> self, auto name) {
 		auto file = Rc<File>::make();
 		self->files.insert(string{std::move(name), getAllocator()}, file);
@@ -272,6 +275,29 @@ public:
 		auto dir = Rc<Directory>::make(self);
 		self->dirs.insert(string{std::move(name), getAllocator()}, dir);
 		return dir;
+	}
+
+	static int remove_file(Rc<Directory> self, frg::string_view name) {
+		// TODO
+		return 0;
+	}
+
+	static int remove_dir(Rc<Directory> self, frg::string_view name) {
+		auto dir = self->dirs.get(name);
+		if (dir != nullptr) {
+			// TODO implement
+			if ((*dir)->is_empty()) {
+				self->dirs.remove(string{name, getAllocator()});
+				return 0;
+			} else {
+				return ENOTEMPTY;
+			}
+		}
+		auto file = self->files.get(name);
+		if (file) {
+			return ENOTDIR;
+		}
+		return ENOENT;
 	}
 
 	static frg::variant<NoEntry, Rc<File>, Rc<Directory>> find(Rc<Directory> base, frg::string_view path) {
@@ -659,6 +685,25 @@ public:
 		}
 	}
 
+	int unlinkat(int dirfd, const char* path, int flags) {
+		auto base = this->get_base(dirfd, path);
+		auto loc = Directory::find(base, path_dirname(path));
+		if (loc.is<Rc<Directory>>()) {
+			auto locdir = loc.get<Rc<Directory>>();
+			// TODO remove trailing slash from pathname
+			// TODO check that filename isn't empty
+			if (flags & AT_REMOVEDIR) {
+				return Directory::remove_dir(locdir, path_filename(path));
+			} else {
+				return Directory::remove_file(locdir, path_filename(path));
+			}
+		} else if (loc.is<Rc<File>>()) {
+			return ENOTDIR;
+		} else {
+			return ENOENT;
+		}
+	}
+
 	Rc<FileTableEntry> get(int fd) {
 		if (check_fd(fd)) {
 			return nullptr;
@@ -1003,10 +1048,7 @@ int sys_getcwd(char *buf, size_t size) {
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
-	auto ret = do_syscall(SYS_unlinkat, dfd, path, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return vfs::get_file_table().unlinkat(dfd, path, flags);
 }
 
 int sys_sleep(time_t *secs, long *nanos) {
@@ -1769,10 +1811,7 @@ int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char 
 }
 
 int sys_rmdir(const char *path) {
-	auto ret = do_syscall(SYS_unlinkat, AT_FDCWD, path, AT_REMOVEDIR);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return vfs::get_file_table().unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 int sys_ftruncate(int fd, size_t size) {

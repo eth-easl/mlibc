@@ -27,6 +27,9 @@ int main() {
     close(fd3);
 
     int res = remove("foo/bar");
-    printf("res: %d\n", res);
+    if (res != 0) {
+        perror("remove");
+    }
+
     return 0;
 }
