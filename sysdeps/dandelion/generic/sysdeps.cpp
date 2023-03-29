@@ -39,50 +39,6 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 
 namespace mlibc {
 
-template <typename T>
-class box {
-	T* ptr{nullptr};
-	void destroy() {
-		if (this->ptr) {
-			this->ptr->~T();
-			getAllocator().free(this->ptr);
-		}
-	}
-public:
-	~box() {
-		this->destroy();
-	}
-	box(T* ptr) : ptr{ptr} {}
-	box(box const&) = delete;
-	box(box&& other) : ptr{other.ptr} {
-		other.ptr = nullptr;
-	}
-	box& operator=(box&& other) {
-		this->destroy();
-		this->ptr = other.ptr;
-		other.ptr = nullptr;
-	}
-	box& operator=(box const&) = delete;
-	T& operator*() {
-		return *this->ptr;
-	}
-	T const& operator*() const {
-		return *this->ptr;
-	}
-	T* operator->() {
-		return this->ptr;
-	}
-	T& operator[](long long offset) {
-		return this->ptr[offset];
-	}
-	T const& operator[](long long offset) const {
-		return this->ptr[offset];
-	}
-	T* get() {
-		return this->ptr;
-	}
-};
-
 namespace vfs {
 
 void test_init_dandelion() {
@@ -302,15 +258,19 @@ public:
 	// Directory() : parent{this} {}
 	Directory(Rc<Directory> parent) : parent{parent} {}
 
-	Rc<File> create_file(auto name) {
+	void set_parent(Rc<Directory> parent) {
+		this->parent = parent;
+	}
+
+	static Rc<File> create_file(Rc<Directory> self, auto name) {
 		auto file = Rc<File>::make();
-		this->files.insert(string{std::move(name), getAllocator()}, file);
+		self->files.insert(string{std::move(name), getAllocator()}, file);
 		return file;
 	}
 
-	Rc<Directory> create_dir(auto name) {
-		auto dir = Rc<Directory>::make(this);
-		this->dirs.insert(string{std::move(name), getAllocator()}, dir);
+	static Rc<Directory> create_dir(Rc<Directory> self, auto name) {
+		auto dir = Rc<Directory>::make(self);
+		self->dirs.insert(string{std::move(name), getAllocator()}, dir);
 		return dir;
 	}
 
@@ -411,10 +371,10 @@ private:
 	friend class FileTable;
 	friend void sys_exit(int status);
 
+public:
 	FileTableEntry(OpenFile fdata) : internal{std::move(fdata)} {};
 	FileTableEntry(OpenDir dirdata) : internal{std::move(dirdata)} {};
 
-public:
 	int read(void* buffer, size_t size, ssize_t* bytes_read) {
 		if (this->internal.is<OpenDir>()) {
 			*bytes_read = -1;
@@ -549,7 +509,7 @@ class FileTable {
 
 	int create_entry(auto&&... args) {
 		size_t idx = this->find_free_slot();
-		this->create_entry_at(idx, std::forward<decltype(args)...>(args...));
+		this->create_entry_at(idx, std::forward<decltype(args)>(args)...);
 		return static_cast<int>(idx);
 	}
 
@@ -557,7 +517,7 @@ class FileTable {
 		if (this->open_files.size() < idx + 1) {
 			this->open_files.resize(idx + 1);
 		}
-		auto entry = Rc<FileTableEntry>::make(std::forward<decltype(args)...>(args...));
+		auto entry = Rc<FileTableEntry>::make(std::forward<decltype(args)>(args)...);
 		this->open_files[idx] = std::move(entry);
 	}
 
@@ -584,7 +544,8 @@ public:
 	FileTable() {
 		// test_init_dandelion();
 
-		this->fs_root = Rc<Directory>::make();
+		this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
+		this->fs_root->set_parent(this->fs_root);
 		this->working_dir = this->fs_root;
 
 
@@ -662,7 +623,7 @@ public:
 				}
 			}
 
-			file = loc->create_file(path_filename(path));
+			file = Directory::create_file(loc, path_filename(path));
 		}
 
 		// if we're opening in truncation mode, set the size of the file to 0
@@ -690,7 +651,7 @@ public:
 			// TODO remove trailing slash from pathname
 			// TODO check that filename isn't empty
 			// TODO chck if exists 
-			locdir->create_dir(path_filename(path));
+			Directory::create_dir(locdir, path_filename(path));
 			return 0;
 		} else {
 			// TODO correct error code

@@ -8,13 +8,15 @@
 template <typename T>
 class Rc {
     struct RefCounted {
-        T value;
         size_t refcount;
+        T value;
+
+        RefCounted(auto&&... args) : refcount{1}, value{std::forward<decltype(args)>(args)...} {}
     };
 
     RefCounted *ptr;
-    Rc(RefCounted *ptr) : ptr(ptr) {}
 
+    Rc(RefCounted *ptr) : ptr(ptr) {}
 
     void maybe_destroy() {
         if (ptr) {
@@ -29,10 +31,9 @@ public:
     Rc() : ptr(nullptr) {}
     Rc(nullptr_t) : ptr(nullptr) {}
 
-    template <typename... Args>
-    static auto make(Args&&... args) -> Rc<T>{
-        RefCounted* ptr = getAllocator().allocate(sizeof(RefCounted));
-        ::new (ptr) RefCounted{std::forward<Args>(args)..., 1};
+    static auto make(auto&&... args) -> Rc<T>{
+        RefCounted* ptr = static_cast<RefCounted*>(getAllocator().allocate(sizeof(RefCounted)));
+        ::new (ptr) RefCounted{std::forward<decltype(args)>(args)...};
         return Rc<T>(ptr);
     }
 
