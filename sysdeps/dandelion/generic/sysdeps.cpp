@@ -594,11 +594,6 @@ public:
 				0,
 				O_WRONLY
 		});
-
-		// TESTING
-		// __ensure(!strcmp(normalize_path("/hello/world", "../testpath/./file.txt"), "/hello/testpath/file.txt"));
-		// __ensure(!strcmp(normalize_path("/hello/.loca/", "../testpath/./../end/./file.txt"), "/hello/end/file.txt"));
-		// add_buf_to_set(&dandelion.root_output_set, "hello.txt");
 	}
 
 	int set_cwd(const char* path) {
@@ -704,6 +699,27 @@ public:
 		}
 	}
 
+	int fcntl(int fd, int cmd, int arg, int* result) {
+		auto entry = this->get(fd);
+		if (entry == nullptr) {
+			return EBADF;
+		}
+		auto file = entry->get_file();
+		if (file == nullptr) {
+			return EISDIR;
+		}
+		switch (cmd) {
+			case F_GETFL:
+				*result = file->get_flags();
+				return 0;
+			case F_SETFL:
+				file->set_flags(arg);
+				return 0;
+			default:
+				return EINVAL;
+		}
+	}
+
 	Rc<FileTableEntry> get(int fd) {
 		if (check_fd(fd)) {
 			return nullptr;
@@ -746,7 +762,6 @@ FileTable& get_file_table() {
 	static frg::eternal<FileTable> list;
 	return *list;
 }
-
 
 };
 
@@ -856,14 +871,6 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
 	return file->seek(offset, whence, new_offset);
 }
 
-int sys_seek_old(int fd, off_t offset, int whence, off_t *new_offset) {
-	auto ret = do_syscall(SYS_lseek, fd, offset, whence);
-	if(int e = sc_error(ret); e)
-		return e;
-	*new_offset = sc_int_result<off_t>(ret);
-	return 0;
-}
-
 int sys_chmod(const char *pathname, mode_t mode) {
 	(void)pathname;
 	(void)mode;
@@ -919,12 +926,10 @@ int sys_vm_unmap(void *pointer, size_t size) {
 #ifndef MLIBC_BUILDING_RTDL
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
-	struct timespec tp = {};
-	auto ret = do_syscall(SYS_clock_gettime, clock, &tp);
-	if (int e = sc_error(ret); e)
-		return e;
-	*secs = tp.tv_sec;
-	*nanos = tp.tv_nsec;
+	// TODO get initial time from auxv
+	(void)clock;
+	*secs = 0;
+	*nanos = 0;
 	return 0;
 }
 
@@ -943,25 +948,21 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
 		flags |= AT_EMPTY_PATH;
 	else
 		__ensure(fsfdt == fsfd_target::fd_path);
-
-	auto ret = do_cp_syscall(SYS_newfstatat, fd, path, statbuf, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return EACCES;
+	// auto ret = do_cp_syscall(SYS_newfstatat, fd, path, statbuf, flags);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
-	auto ret = do_cp_syscall(SYS_statfs, path, buf);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)path, (void)buf;
+	return ENOSYS;
 }
 
 int sys_fstatfs(int fd, struct statfs *buf) {
-	auto ret = do_cp_syscall(SYS_fstatfs, fd, buf);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)buf;
+	return ENOSYS;
 }
 
 // extern "C" void __mlibc_signal_restore(void);
@@ -1001,40 +1002,32 @@ int sys_sigaction(int signum, const struct sigaction *act,
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {
-        auto ret = do_syscall(SYS_socket, domain, type, protocol);
-        if (int e = sc_error(ret); e)
-                return e;
-        *fd = sc_int_result<int>(ret);
-        return 0;
+	(void)domain;
+	(void)type;
+	(void)protocol;
+	*fd = -1;
+	return EACCES;
 }
 
 int sys_msg_send(int sockfd, const struct msghdr *msg, int flags, ssize_t *length) {
-        auto ret = do_cp_syscall(SYS_sendmsg, sockfd, msg, flags);
-        if (int e = sc_error(ret); e)
-                return e;
-        *length = sc_int_result<ssize_t>(ret);
-        return 0;
+	(void)sockfd;
+	(void)msg;
+	(void)flags;
+	*length = -1;
+	return EBADF;
 }
 
 int sys_msg_recv(int sockfd, struct msghdr *msg, int flags, ssize_t *length) {
-        auto ret = do_cp_syscall(SYS_recvmsg, sockfd, msg, flags);
-        if (int e = sc_error(ret); e)
-                return e;
-        *length = sc_int_result<ssize_t>(ret);
-        return 0;
+	(void)sockfd;
+	(void)msg;
+	(void)flags;
+	*length = -1;
+	return EBADF;
 }
 
 int sys_fcntl(int fd, int cmd, va_list args, int *result) {
-        auto arg = va_arg(args, unsigned long);
-        // TODO: the api for linux differs for each command so fcntl()s might fail with -EINVAL
-        // we should implement all the different fcntl()s
-	// TODO(geert): only some fcntl()s can fail with -EINTR, making do_cp_syscall useless
-	// on most fcntls(). Another reason to handle different fcntl()s seperately.
-        auto ret = do_cp_syscall(SYS_fcntl, fd, cmd, arg);
-        if (int e = sc_error(ret); e)
-                return e;
-        *result = sc_int_result<int>(ret);
-        return 0;
+	auto arg = va_arg(args, unsigned long);
+	return vfs::get_file_table().fcntl(fd, cmd, arg, result);
 }
 
 int sys_getcwd(char *buf, size_t size) {
@@ -1082,44 +1075,42 @@ int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
 }
 
 int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-        auto ret = do_cp_syscall(SYS_connect, sockfd, addr, addrlen);
-        if (int e = sc_error(ret); e)
-                return e;
-        return 0;
+	(void)sockfd, (void)addr, (void)addrlen;
+	return EACCES;
 }
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
                 fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask, int *num_events) {
-        // The Linux kernel really wants 7 arguments, even tho this is not supported
-        // To fix that issue, they use a struct as the last argument.
-        // See the man page of pselect and the glibc source code
-        struct {
-                sigset_t ss;
-                size_t ss_len;
-        } data;
-        data.ss = (uintptr_t)sigmask;
-        data.ss_len = NSIG / 8;
+	// The Linux kernel really wants 7 arguments, even tho this is not supported
+	// To fix that issue, they use a struct as the last argument.
+	// See the man page of pselect and the glibc source code
+	struct {
+			sigset_t ss;
+			size_t ss_len;
+	} data;
+	data.ss = (uintptr_t)sigmask;
+	data.ss_len = NSIG / 8;
 
-        auto ret = do_cp_syscall(SYS_pselect6, nfds, readfds, writefds,
-                        exceptfds, timeout, &data);
-        if (int e = sc_error(ret); e)
-                return e;
-        *num_events = sc_int_result<int>(ret);
-        return 0;
+	auto ret = do_cp_syscall(SYS_pselect6, nfds, readfds, writefds,
+					exceptfds, timeout, &data);
+	if (int e = sc_error(ret); e)
+			return e;
+	*num_events = sc_int_result<int>(ret);
+	return 0;
 }
 
 int sys_pipe(int *fds, int flags) {
-        if(flags) {
-                auto ret = do_syscall(SYS_pipe2, fds, flags);
-                if (int e = sc_error(ret); e)
-                        return e;
-                return 0;
-        } else {
-				auto ret = do_syscall(SYS_pipe2, fds, 0);
-                if (int e = sc_error(ret); e)
-                        return e;
-                return 0;
-        }
+	if(flags) {
+		auto ret = do_syscall(SYS_pipe2, fds, flags);
+		if (int e = sc_error(ret); e)
+				return e;
+		return 0;
+	} else {
+		auto ret = do_syscall(SYS_pipe2, fds, 0);
+		if (int e = sc_error(ret); e)
+				return e;
+		return 0;
+	}
 }
 
 int sys_fork(pid_t *child) {
@@ -1128,66 +1119,48 @@ int sys_fork(pid_t *child) {
 }
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
-	(void)pid;
-	(void)status;
-	(void)flags;
-	(void)ru;
-	(void)ret_pid;
+	(void)pid, (void)status, (void)flags, (void)ru, (void)ret_pid;
 	return ECHILD;
 }
 
 int sys_execve(const char *path, char *const argv[], char *const envp[]) {
-	(void)path;
-	(void)argv;
-	(void)envp;
+	(void)path, (void)argv, (void)envp;
 	return EACCES;
 }
 
 int sys_sigprocmask(int how, const sigset_t *set, sigset_t *old) {
-        auto ret = do_syscall(SYS_rt_sigprocmask, how, set, old, NSIG / 8);
-        if (int e = sc_error(ret); e)
-                return e;
-	return 0;
+	(void)how, (void)set, (void)old;
+	return EINVAL;
 }
 
 int sys_setresuid(uid_t ruid, uid_t euid, uid_t suid) {
-	auto ret = do_syscall(SYS_setresuid, ruid, euid, suid);
-        if (int e = sc_error(ret); e)
-                return e;
+	(void)ruid, (void)euid, (void)suid;
 	return 0;
 }
 
 int sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
-	auto ret = do_syscall(SYS_setresgid, rgid, egid, sgid);
-        if (int e = sc_error(ret); e)
-                return e;
+	(void)rgid, (void)egid, (void)sgid;
 	return 0;
 }
 
 int sys_setreuid(uid_t ruid, uid_t euid) {
-	auto ret = do_syscall(SYS_setreuid, ruid, euid);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)ruid, (void)euid;
 	return 0;
 }
 
 int sys_setregid(gid_t rgid, gid_t egid) {
-	auto ret = do_syscall(SYS_setregid, rgid, egid);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)rgid, (void)egid;
 	return 0;
 }
 
 int sys_sysinfo(struct sysinfo *info) {
-	auto ret = do_syscall(SYS_sysinfo, info);
-        if (int e = sc_error(ret); e)
-                return e;
+	// todo return actually interesting information
+	memset(info, 0, sizeof(*info));
+	info->mem_unit = 1;
 	return 0;
 }
 
-void sys_yield() {
-	// do_syscall(SYS_sched_yield);
-}
+void sys_yield() {}
 
 int sys_clone(void *tcb, pid_t *pid_out, void *stack) {
 	unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
@@ -1237,9 +1210,7 @@ int sys_before_cancellable_syscall(ucontext_t *uct) {
 }
 
 int sys_tgkill(int tgid, int tid, int sig) {
-	auto ret = do_syscall(SYS_tgkill, tgid, tid, sig);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)tgid, (void)tid, (void)sig;
 	return 0;
 }
 
@@ -1295,25 +1266,21 @@ int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
 }
 
 int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length) {
-	auto ret = do_syscall(SYS_accept, fd, addr_ptr, addr_length, 0, 0, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	*newfd = sc_int_result<int>(ret);
-	return 0;
+	(void)fd, (void)addr_ptr, (void)addr_length;
+	*newfd = -1;
+	// we allow no sockets to be created, so any fd must be bad
+	return EBADF;
 }
 
 int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
-	auto ret = do_syscall(SYS_bind, fd, addr_ptr, addr_length, 0, 0, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)addr_ptr, (void)addr_length;
+	// we allow no sockets to be created, so any fd must be bad
+	return EBADF;
 }
 
 int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t size) {
-	auto ret = do_syscall(SYS_setsockopt, fd, layer, number, buffer, size, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)layer, (void)number, (void)buffer, (void)size;
+	return EBADF;
 }
 
 int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
@@ -1451,24 +1418,18 @@ int sys_getrusage(int scope, struct rusage *usage) {
 }
 
 int sys_madvise(void *addr, size_t length, int advice) {
-	auto ret = do_syscall(SYS_madvise, addr, length, advice);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)addr, (void)length, (void)advice;
 	return 0;
 }
 
 int sys_msync(void *addr, size_t length, int flags) {
-	auto ret = do_syscall(SYS_msync, addr, length, flags);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)addr, (void)length, (void)flags;
 	return 0;
 }
 
 int sys_reboot(int cmd) {
-	auto ret = do_syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, nullptr);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)cmd;
+	return EPERM;
 }
 
 int sys_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
@@ -1480,17 +1441,13 @@ int sys_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
 
 int sys_mount(const char *source, const char *target,
 	const char *fstype, unsigned long flags, const void *data) {
-	auto ret = do_syscall(SYS_mount, source, target, fstype, flags, data);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)source, (void)target, (void)fstype, (void)flags, (void)data;
+	return EPERM;
 }
 
 int sys_umount2(const char *target, int flags) {
-	auto ret = do_syscall(SYS_umount2, target, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)target, (void)flags;
+	return EPERM;
 }
 
 int sys_sethostname(const char *buffer, size_t bufsize) {
@@ -1563,31 +1520,24 @@ int sys_inotify_create(int flags, int *fd) {
 }
 
 int sys_init_module(void *module, unsigned long length, const char *args) {
-	auto ret = do_syscall(SYS_init_module, module, length, args);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)module, (void)length, (void)args;
+	return EPERM;
 }
 
 int sys_delete_module(const char *name, unsigned flags) {
-	auto ret = do_syscall(SYS_delete_module, name, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)name, (void)flags;
+	return EPERM;
 }
 
 int sys_klogctl(int type, char *bufp, int len, int *out) {
-	auto ret = do_syscall(SYS_syslog, type, bufp, len);
-	if (int e = sc_error(ret); e)
-		return e;
-	*out = sc_int_result<int>(ret);
-	return 0;
+	(void)type, (void)bufp, (void)len, (void)out;
+	return ENOSYS;
 }
 
 int sys_getcpu(int *cpu) {
-	auto ret = do_syscall(SYS_getcpu, cpu, NULL, NULL);
-	if (int e = sc_error(ret); e)
-		return e;
+	if (cpu != nullptr) {
+		*cpu = 0;
+	}
 	return 0;
 }
 
@@ -1599,24 +1549,18 @@ int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) {
 }
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
-	auto ret = do_syscall(SYS_getsockopt, fd, layer, number, buffer, size, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)layer, (void)number, (void)buffer, (void)size;
+	return EBADF;
 }
 
 int sys_inotify_add_watch(int ifd, const char *path, uint32_t mask, int *wd) {
-	auto ret = do_syscall(SYS_inotify_add_watch, ifd, path, mask);
-	if (int e = sc_error(ret); e)
-		return e;
-	*wd = sc_int_result<int>(ret);
-	return 0;
+	(void)ifd, (void)path, (void)mask, (void)wd;
+	*wd = -1;
+	return ENOSPC;
 }
 
 int sys_inotify_rm_watch(int ifd, int wd) {
-	auto ret = do_syscall(SYS_inotify_rm_watch, ifd, wd);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)ifd, (void)wd;
 	return 0;
 }
 
@@ -1639,10 +1583,9 @@ int sys_mlockall(int flags) {
 #endif // __MLIBC_POSIX_OPTION
 
 int sys_times(struct tms *tms, clock_t *out) {
-	auto ret = do_syscall(SYS_times, tms);
-	if (int e = sc_error(ret); e)
-		return e;
-	*out = sc_int_result<long>(ret);
+	// TODO fill tms
+	(void)tms;
+	*out = 0;
 	return 0;
 }
 
@@ -1651,11 +1594,7 @@ pid_t sys_getpid() {
 }
 
 pid_t sys_gettid() {
-	// dandelion is single-threaded by design
 	return 1;
-	// auto ret = do_syscall(SYS_gettid);
-	// // gettid() always succeeds.
-	// return sc_int_result<pid_t>(ret);
 }
 
 uid_t sys_getuid() {
@@ -1688,7 +1627,7 @@ int sys_vm_protect(void *pointer, size_t size, int prot) {
 }
 
 void sys_thread_exit() {
-	do_syscall(SYS_exit, 0);
+	sys_exit(0);
 	__builtin_trap();
 }
 
@@ -1706,23 +1645,29 @@ void sys_exit(int status) {
 #define FUTEX_WAKE 1
 
 int sys_futex_tid() {
-	auto ret = do_syscall(SYS_gettid);
-	// gettid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
-	auto ret = do_cp_syscall(SYS_futex, pointer, FUTEX_WAIT, expected, time);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)time;
+	if (*pointer != expected) {
+		return EAGAIN;
+	} else {
+		return EINTR;
+	}
+	// auto ret = do_cp_syscall(SYS_futex, pointer, FUTEX_WAIT, expected, time);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_futex_wake(int *pointer) {
-	auto ret = do_syscall(SYS_futex, pointer, FUTEX_WAKE, INT_MAX);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)pointer;
 	return 0;
+	// auto ret = do_syscall(SYS_futex, pointer, FUTEX_WAKE, INT_MAX);
+	// if (int e = sc_error(ret); e)
+	// 	return e;
+	// return 0;
 }
 
 int sys_sigsuspend(const sigset_t *set) {
@@ -1740,7 +1685,6 @@ int sys_mkdir(const char *path, mode_t mode) {
 	(void)mode;
 	return vfs::get_file_table().mkdirat(AT_FDCWD, path);
 }
-
 
 int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
 	(void)mode;
@@ -1837,30 +1781,22 @@ int sys_getrlimit(int resource, struct rlimit *limit) {
 }
 
 int sys_setrlimit(int resource, const struct rlimit *limit) {
-	auto ret = do_syscall(SYS_setrlimit, resource, limit);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)resource, (void)limit;
 	return 0;
 }
 
 pid_t sys_getppid() {
-	auto ret = do_syscall(SYS_getppid);
-	// getppid() always succeeds.
-	return sc_int_result<pid_t>(ret);
+	return 1;
 }
 
 int sys_setpgid(pid_t pid, pid_t pgid) {
-	auto ret = do_syscall(SYS_setpgid, pid, pgid);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)pid, (void)pgid;
+	return EPERM;
 }
 
 pid_t sys_getsid(pid_t pid, pid_t *sid) {
-	auto ret = do_syscall(SYS_getsid, pid);
-	if (int e = sc_error(ret); e)
-		return e;
-	*sid = sc_int_result<pid_t>(ret);
+	(void)pid;
+	*sid = 1;
 	return 0;
 }
 
@@ -1881,8 +1817,7 @@ int sys_getpgid(pid_t pid, pid_t *out) {
 }
 
 int sys_getgroups(size_t size, const gid_t *list, int *retval) {
-	(void)size;
-	(void)list;
+	(void)size, (void)list;
 	*retval = 0;
 	return 0;
 }
