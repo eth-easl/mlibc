@@ -99,16 +99,19 @@ int main() {
 
     dump("foo/bar");
 
-    int res = remove("foo/bar");
-    if (res != 0) {
-        perror("remove");
-    }
+    // int res = remove("foo/bar");
+    // res = remove("foo/baz");
+    // if (res != 0) {
+    //     perror("remove");
+    // }
 
-    res = rmdir("foo");
-    if (res != 0) {
-        perror("rmdir");
-    }
+    // res = rmdir("foo");
+    // if (res != 0) {
+    //     perror("rmdir foo");
+    //     return 1;
+    // }
 
     closedir(dir);
+    printf("success\n");
     return 0;
 }

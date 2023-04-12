@@ -38,17 +38,65 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 
 namespace mlibc {
 
-namespace vfs {
+namespace debug {
+
+int write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
+	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
+	if(int e = sc_error(ret); e)
+		return e;
+	*bytes_written = sc_int_result<ssize_t>(ret);
+	return 0;
+}
+
+int write_all(int fd, const void *buffer, size_t size) {
+	size_t written = 0;
+	while (written < size) {
+		ssize_t bytes_written;
+		int e = write(fd, (const char*)buffer + written, size - written, &bytes_written);
+		if (e) {
+			return e;
+		}
+		written += bytes_written;
+	}
+	return 0;
+}
+
+void dump_io_buf(const char* setid, io_buf* buf) {
+	char tmp[256];
+	size_t setidlen = strlen(setid);
+	memcpy(tmp, setid, setidlen);
+	size_t identlen = 0;
+	if (buf->ident) {
+		tmp[setidlen] = '/';
+		identlen = strlen(buf->ident);
+		memcpy(tmp + setidlen + 1, buf->ident, identlen);
+		++identlen;
+	}
+	tmp[setidlen + identlen] = ':';
+	tmp[setidlen + identlen + 1] = '\n';
+	write_all(1, tmp, setidlen + identlen + 2);
+	write_all(1, buf->buffer, buf->size);
+}
+
+void dump_io_set(io_set* set) {
+	for (io_buf* buf = set->buf_head; buf; buf = buf->next) {
+		dump_io_buf(set->ident, buf);
+	}
+}
 
 void test_init_dandelion() {
-
 	static const char input_file_content[] = "This is an example input file";
 	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
+	static io_set out_set{nullptr, "output", nullptr};
 
 	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
 	dandelion.input_root = {nullptr, "", &example_input_file};
-	dandelion.output_root = {nullptr, "", nullptr};
+	dandelion.output_root = {&out_set, "", nullptr};
 }
+
+}; // namespace debug
+
+namespace vfs {
 
 struct NoEntry {};
 
@@ -203,7 +251,8 @@ public:
 		const char* endp = bufp + maxsize;
 
 		// needing to advance these iterators is a bit awkward, but hash maps don't support
-		// random access iterators. this should not be a problem in practice, though.
+		// random access iterators. this should not be a problem in practice, though, as huge
+		// directories are quite rare.
 
 		auto filebegin = this->files.begin();
 		for (size_t i = 0; i < file_offset(offset); ++i) {
@@ -238,13 +287,13 @@ public:
 
 	static Rc<File> create_file(Rc<Directory> self, frg::string_view name) {
 		auto file = Rc<File>::make();
-		self->files.insert(string{std::move(name), getAllocator()}, file);
+		self->files.insert(string{name, getAllocator()}, file);
 		return file;
 	}
 
 	static Rc<Directory> create_dir(Rc<Directory> self, frg::string_view name) {
 		auto dir = Rc<Directory>::make(self);
-		self->dirs.insert(string{std::move(name), getAllocator()}, dir);
+		self->dirs.insert(string{name, getAllocator()}, dir);
 		return dir;
 	}
 
@@ -319,6 +368,15 @@ public:
 		}
 		// should be unreachable
 		return NoEntry{};
+	}
+
+	void for_each(auto file_func, auto dir_func) {
+		for (auto& file : this->files) {
+			file_func(file.get<0>(), file.get<1>());
+		}
+		for (auto& dir : this->dirs) {
+			dir_func(dir.get<0>(), dir.get<1>());
+		}
 	}
 
 };
@@ -577,9 +635,28 @@ class FileTable {
 		return 0;
 	}
 
+	void create_bufs_from_dir(io_set* set, Rc<Directory> dir, frg::string_view path) {
+		dir->for_each([&](const string& name, Rc<File>& file) {
+			char* buf_ident = (char*)getAllocator().allocate(path.size() + name.size() + 2);
+			memcpy(buf_ident, path.data(), path.size());
+			buf_ident[path.size()] = '/';
+			memcpy(buf_ident + path.size() + 1, name.data(), name.size());
+			buf_ident[path.size() + name.size() + 1] = '\0';
+
+			io_buf* buf = (io_buf*)getAllocator().allocate(sizeof(io_buf));
+			buf = ::new (buf) io_buf{set->buf_head, buf_ident, file->buffer(), file->size()};
+			set->buf_head = buf;
+		}, [&](const string& name, Rc<Directory>& subdir) {
+			string new_path{path, getAllocator()};
+			new_path += '/';
+			new_path += name;
+			create_bufs_from_dir(set, subdir, new_path);
+		});
+	}
+
 public:
 	FileTable() {
-		test_init_dandelion();
+		debug::test_init_dandelion();
 
 		this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
 		this->fs_root->set_parent(this->fs_root);
@@ -593,7 +670,7 @@ public:
 
 		this->create_entry_at(0,
 			FileTableEntry::OpenFile {
-				Rc<File>::make(),
+				Rc<File>::make(&dandelion.stdin),
 				0,
 				O_RDONLY
 		});
@@ -604,12 +681,30 @@ public:
 				0,
 				O_WRONLY
 		});
+
 		this->create_entry_at(2,
 			FileTableEntry::OpenFile {
 				Rc<File>::make(),
 				0,
 				O_WRONLY
 		});
+	}
+
+	void finalize() {
+		for (auto* set = dandelion.output_root.next; set != nullptr; set = set->next) {
+			auto entry = Directory::find(this->fs_root, set->ident);
+			if (entry.is<Rc<Directory>>()) {
+				create_bufs_from_dir(set, entry.get<Rc<Directory>>(), set->ident);
+			}
+		}
+
+		auto stdout_file = this->get(1)->get_file();
+		dandelion.stdout.buffer = stdout_file->buffer();
+		dandelion.stdout.size = stdout_file->size();
+
+		auto stderr_file = this->get(2)->get_file();
+		dandelion.stderr.buffer = stderr_file->buffer();
+		dandelion.stderr.size = stderr_file->size();
 	}
 
 	FileTable(const FileTable&) = delete;
@@ -808,23 +903,7 @@ FileTable& get_file_table() {
 	return *list;
 }
 
-};
-
-int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
-	auto ret = do_cp_syscall(SYS_read, fd, buffer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_read = sc_int_result<ssize_t>(ret);
-	return 0;
-}
-
-int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_written = sc_int_result<ssize_t>(ret);
-	return 0;
-}
+}; // namespace vfs
 
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
@@ -1568,9 +1647,15 @@ void sys_thread_exit() {
 }
 
 void sys_exit(int status) {
-	ssize_t written;
-	auto& f = *vfs::get_file_table().get(1)->get_file();
-	sys_write_old(1, f.buffer(), f.size(), &written);
+	vfs::get_file_table().finalize();
+
+	// dump stdout file to console
+
+	debug::dump_io_buf("stdout", &dandelion.stdout);
+	debug::dump_io_buf("stderr", &dandelion.stderr);
+
+
+
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
