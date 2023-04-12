@@ -1,6 +1,6 @@
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
-#include <linux/reboot.h>
 
 #include <type_traits>
 
@@ -13,6 +13,8 @@
 #include <mlibc/allocator.hpp>
 #include <limits.h>
 #include <sys/syscall.h>
+#include "abi-bits/errno.h"
+#include "abi-bits/fcntl.h"
 #include "cxx-syscall.hpp"
 #include "frg/string.hpp"
 #include "mlibc/posix-sysdeps.hpp"
@@ -44,123 +46,11 @@ namespace vfs {
 void test_init_dandelion() {
 
 	static const char input_file_content[] = "This is an example input file";
-	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content), sizeof(input_file_content)};
+	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
 
-	dandelion.stdin = {nullptr, nullptr, nullptr, 0, 0};
-	dandelion.root_input_set = {nullptr, "/", &example_input_file};
-	dandelion.root_output_set = {nullptr, "/", nullptr};
-}
-
-void init_io_buf(io_buf* buf, const char* ident, io_buf* next) {
-	constexpr size_t initial_bufsize = 1024;
-
-	if (ident) {
-		char* owned_ident = static_cast<char*>(getAllocator().allocate(strlen(ident) + 1));
-		strcpy(owned_ident, ident);
-		buf->ident = owned_ident;
-	} else {
-		buf->ident = nullptr;
-	}
-
-	buf->next = next;
-	buf->buffer = getAllocator().allocate(initial_bufsize);
-	buf->size = 0;
-	buf->capacity = initial_bufsize;
-}
-
-io_buf* find_buf_in_set(io_set* set, const char* buf_ident) {
-	for (io_buf* current = set->buf_head; current != nullptr; current = current->next) {
-		if (current->ident && strcmp(current->ident, buf_ident) == 0) {
-			return current;
-		}
-	}
-	return nullptr;
-}
-
-io_set* find_set(io_set* root, const char* set_ident, size_t ident_len) {
-	// we skip the root set, because it doesn't have an identifier
-	for (io_set* current = root->next; current != nullptr; current = current->next) {
-		if (strncmp(current->ident, set_ident, ident_len) == 0) {
-			return current;
-		}
-	}
-	return nullptr;
-}
-
-io_buf* add_buf_to_set(io_set* set, const char* buf_ident) {
-	auto* buf = static_cast<io_buf*>(getAllocator().allocate(sizeof(io_buf)));
-	::new (buf) io_buf;
-	init_io_buf(buf, buf_ident, set->buf_head);
-	set->buf_head = buf;
-	return buf;
-}
-
-char* normalize_path(const char* dir, const char* path) {
-	struct PathSegment {
-		size_t begin;
-		size_t end; // exclusive
-	};
-
-	char* base;
-	if (path[0] == '/') {
-		base = static_cast<char*>(getAllocator().allocate(strlen(path) + 1));
-		strcpy(base, path);
-	} else {
-		size_t dir_len = strlen(dir) + 1;
-		size_t path_len = strlen(path) + 1;
-
-		base = static_cast<char*>(getAllocator().allocate(dir_len + path_len));
-		memcpy(base, dir, dir_len);
-		base[dir_len - 1] = '/';
-		memcpy(base + dir_len, path, path_len);
-	}
-
-	frg::vector<PathSegment, MemoryAllocator> segs{getAllocator()};
-	size_t i = 0;
-	while (base[i] != '\0') {
-		while (base[i] == '/') {
-			++i;
-		}
-		if (base[i] == '.') {
-			// ../ pattern
-			if (base[i + 1] == '.' && base[i + 2] == '/') {
-				i += 2;
-				if (segs.size() > 0) {
-					segs.pop();
-				}
-				continue;
-			}
-			// ./ pattern - skip
-			if (base[i + 1] == '/') {
-				i += 1;
-				continue;
-			}
-		}
-		size_t begin_idx = i;
-		while (base[i] != '/' && base[i] != '\0') {
-			++i;
-		}
-		if (i > begin_idx) {
-			segs.emplace_back(begin_idx, i);
-		}
-	}
-
-	// if there are no segments, simply return a root path
-	if (segs.size() == 0) {
-		base[0] = '/';
-		base[1] = '\0';
-		return base;
-	}
-
-	size_t write_offset = 0;
-	for (const PathSegment& seg : segs) {
-		base[write_offset++] = '/';
-		memmove(base + write_offset, base + seg.begin, seg.end - seg.begin);
-		write_offset += seg.end - seg.begin;
-	}
-	base[write_offset++] = '\0';
-
-	return base;
+	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
+	dandelion.input_root = {nullptr, "", &example_input_file};
+	dandelion.output_root = {nullptr, "", nullptr};
 }
 
 struct NoEntry {};
@@ -206,7 +96,10 @@ public:
 		return this->buf;
 	}
 
-	void truncate(size_t size) {
+	int truncate(size_t size) {
+		if (this->is_static) {
+			return EPERM;
+		}
 		if (size <= this->bufsize) {
 			this->bufsize = size;
 		} else {
@@ -214,6 +107,7 @@ public:
 			memset(this->buf + this->bufsize, 0, size - this->bufsize);
 			this->bufsize = size;
 		}
+		return 0;
 	}
 
 	int read_offset(void* buffer, size_t size, size_t offset, ssize_t* bytes_read) {
@@ -245,6 +139,10 @@ public:
 
 using string = frg::string<MemoryAllocator>;
 
+struct Symlink {
+	string target;
+};
+
 class Directory {
 	template <typename T>
 	using entry_map = frg::hash_map<string, T, frg::hash<frg::string_view>, MemoryAllocator>;
@@ -252,9 +150,47 @@ class Directory {
 	Rc<Directory> parent;
 	entry_map<Rc<File>> files{frg::hash<frg::string_view>(), getAllocator()};
 	entry_map<Rc<Directory>> dirs{frg::hash<frg::string_view>(), getAllocator()};
+	entry_map<Symlink> symlinks{frg::hash<frg::string_view>(), getAllocator()};
+
+	size_t read_func(auto begin, auto end, char*& buf, const char* bufend, unsigned char type) {
+		size_t num_read = 0;
+		for (; begin != end; ++begin, ++num_read) {
+			size_t namelen = begin->template get<0>().size();
+			size_t total_len = offsetof(struct dirent, d_name) + namelen + 1;
+			if (total_len > static_cast<size_t>(bufend - buf)) {
+				// this entry would overflow the buffer, so stop here
+				break;
+			}
+
+			// TODO check for integer overflow on total_len
+			// TODO implement offset
+			::new (buf + offsetof(struct dirent, d_ino)) ino_t{0};
+			::new (buf + offsetof(struct dirent, d_off)) off_t{0};
+			::new (buf + offsetof(struct dirent, d_reclen)) unsigned short{(unsigned short)total_len};
+			::new (buf + offsetof(struct dirent, d_type)) unsigned char{type};
+
+			buf += offsetof(struct dirent, d_name);
+			memcpy(buf, begin->template get<0>().data(), namelen);
+			buf += namelen;
+			*buf = '\0';
+			buf += 1;
+		}
+		return num_read;
+	}
+
+	static size_t file_offset(size_t offset) {
+		return offset & static_cast<uint32_t>(~1);
+	}
+
+	static size_t dir_offset(size_t offset) {
+		return offset >> 32;
+	}
+
+	static size_t create_offset(size_t fileoffset, size_t diroffset) {
+		return (diroffset << 32) | fileoffset;
+	}
 
 public:
-	// Directory() : parent{this} {}
 	Directory(Rc<Directory> parent) : parent{parent} {}
 
 	void set_parent(Rc<Directory> parent) {
@@ -265,27 +201,68 @@ public:
 		return this->files.empty() && this->dirs.empty();
 	}
 
-	static Rc<File> create_file(Rc<Directory> self, auto name) {
+	int read_entries_offset(void* buffer, size_t maxsize, size_t* bytes_read, size_t& offset) {
+		char* bufp = static_cast<char*>(buffer);
+		const char* endp = bufp + maxsize;
+
+		// needing to advance these iterators is a bit awkward, but hash maps don't support
+		// random access iterators. this should not be a problem in practice, though.
+
+		auto filebegin = this->files.begin();
+		for (size_t i = 0; i < file_offset(offset); ++i) {
+			++filebegin;
+		}
+
+		auto dirbegin = this->dirs.begin();
+		for (size_t i = 0; i < dir_offset(offset); ++i) {
+			++dirbegin;
+		}
+
+		size_t files_read = this->read_func(filebegin, this->files.end(), bufp, endp, DT_REG);
+		size_t dirs_read = this->read_func(dirbegin, this->dirs.end(), bufp, endp, DT_DIR);
+
+		offset = create_offset(file_offset(offset) + files_read, dir_offset(offset) + dirs_read);
+		*bytes_read = bufp - static_cast<char*>(buffer);
+
+		return 0;
+	}
+
+	// TODO all of these should somehow handle the case where the file/dir already exists differently
+
+	static int link_file(Rc<Directory> self, frg::string_view name, Rc<File> file) {
+		self->files.insert(string{name, getAllocator()}, file);
+		return 0;
+	}
+
+	static int link_dir(Rc<Directory> self, frg::string_view name, Rc<Directory> dir) {
+		self->dirs.insert(string{name, getAllocator()}, dir);
+		return 0;
+	}
+
+	static Rc<File> create_file(Rc<Directory> self, frg::string_view name) {
 		auto file = Rc<File>::make();
 		self->files.insert(string{std::move(name), getAllocator()}, file);
 		return file;
 	}
 
-	static Rc<Directory> create_dir(Rc<Directory> self, auto name) {
+	static Rc<Directory> create_dir(Rc<Directory> self, frg::string_view name) {
 		auto dir = Rc<Directory>::make(self);
 		self->dirs.insert(string{std::move(name), getAllocator()}, dir);
 		return dir;
 	}
 
 	static int remove_file(Rc<Directory> self, frg::string_view name) {
-		// TODO
-		return 0;
+		auto removed = self->files.remove(string{name, getAllocator()});
+		if (removed) {
+			return 0;
+		} else {
+			return ENOENT;
+		}
 	}
 
 	static int remove_dir(Rc<Directory> self, frg::string_view name) {
 		auto dir = self->dirs.get(name);
 		if (dir != nullptr) {
-			// TODO implement
 			if ((*dir)->is_empty()) {
 				self->dirs.remove(string{name, getAllocator()});
 				return 0;
@@ -349,32 +326,6 @@ public:
 
 };
 
-// void add_set_bufs(Directory* dir, io_set& set, int access) {
-// 	for (auto* buf = set.buf_head; buf != nullptr; buf = buf->next) {
-// 		if (buf->ident != nullptr) {
-// 			dir->create_file(buf->ident, buf, access);
-// 		}
-// 	}
-// };
-
-// void add_sets(io_set& setroot, int access) {
-// 	add_set_bufs(this->root, setroot, access);
-// 	for (auto* set = setroot.next; set != nullptr; set = set->next) {
-// 		if (set->ident != nullptr) {
-// 			auto* dir = this->root->create_dir(set->ident);
-// 			add_set_bufs(dir, *set, access);
-// 		}
-
-// 	}
-// }
-
-// add_set_bufs(this->root, dandelion.root_input_set, O_RDONLY);
-// this->add_sets(dandelion.root_input_set, O_RDONLY);
-
-// add_set_bufs(this->root, dandelion.root_output_set, O_RDWR);
-// this->add_sets(dandelion.root_output_set, O_RDWR);
-
-
 class FileTableEntry {
 public:
 	struct OpenFile {
@@ -389,6 +340,7 @@ public:
 
 	struct OpenDir {
 		Rc<Directory> dir;
+		size_t offset;
 	};
 private:
 
@@ -449,9 +401,12 @@ public:
 
 	int seek(off_t offset, int whence, off_t *new_offset) {
 		if (this->internal.is<OpenDir>()) {
-			*new_offset = -1;
-			// TODO: check: is EISDIR a valid error of seek?
-			return EISDIR;
+			if (whence != SEEK_SET || offset < 0) {
+				return EINVAL;
+			}
+			OpenDir& dir = this->internal.get<OpenDir>();
+			dir.offset = static_cast<size_t>(offset);
+			return 0;
 		} else if (this->internal.is<OpenFile>()) {
 			OpenFile& openfile = this->internal.get<OpenFile>();
 			if (whence == SEEK_SET && offset >= 0) {
@@ -464,10 +419,22 @@ public:
 				*new_offset = -1;
 				return EINVAL;
 			}
+			*new_offset = openfile.offset;
 			return 0;
 		} else {
 			mlibc::panicLogger() << "Invalid FileTableEntry type encountered" << frg::endlog;
 			return EIO;
+		}
+	}
+
+	int read_entries(void* buffer, size_t size, size_t* bytes_read) {
+		if (this->internal.is<OpenDir>()) {
+			OpenDir& opendir = this->internal.get<OpenDir>();
+			// NOTE: opendir.offset is modified by read_entries_offset
+			return opendir.dir->read_entries_offset(buffer, size, bytes_read, opendir.offset);
+		} else {
+			*bytes_read = -1;
+			return ENOTDIR;
 		}
 	}
 
@@ -486,20 +453,26 @@ public:
 	}
 };
 
-frg::string_view path_filename(const char* path) {
-	size_t dirname_len = strlen(path);
-	while (dirname_len > 0 && path[dirname_len - 1] != '/') {
-		--dirname_len;
-	}
-	return {path + dirname_len};
-}
+struct path_split_result {
+	bool is_dir;
+	frg::string_view dir;
+	frg::string_view base;
+};
 
-frg::string_view path_dirname(const char* path) {
-	size_t dirname_len = strlen(path);
-	while (dirname_len > 0 && path[dirname_len - 1] != '/') {
-		--dirname_len;
+path_split_result path_split(frg::string_view path) {
+	size_t end_idx = path.size();
+	if (path[end_idx - 1] == '/') {
+		--end_idx;
 	}
-	return {path, dirname_len};
+	size_t start_idx = end_idx;
+	while (start_idx > 0 && path[start_idx - 1] != '/') {
+		--start_idx;
+	}
+	return {
+		path.size() > 0 && path[path.size() - 1] == '/',
+		path.sub_string(0, start_idx),
+		path.sub_string(start_idx, end_idx - start_idx),
+	};
 }
 
 class FileTable {
@@ -547,7 +520,7 @@ class FileTable {
 		this->open_files[idx] = std::move(entry);
 	}
 
-	Rc<Directory> get_base(int dirfd, const char* path) {
+	Rc<Directory> get_origin(int dirfd, const char* path) {
 		Rc<Directory> base;
 		if (dirfd == AT_FDCWD) {
 			base = this->working_dir;
@@ -596,16 +569,22 @@ public:
 		});
 	}
 
-	int set_cwd(const char* path) {
+	FileTable(const FileTable&) = delete;
+	FileTable(FileTable&&) = delete;
+
+	int set_cwd(int dirfd, const char* path) {
+		auto base = this->get_origin(dirfd, path);
+		if (base == nullptr) {
+			return ENOENT;
+		}
+		this->working_dir = base;
 		return 0;
 	}
 
-	const char* get_cwd() const {
-		return nullptr;
-	}
-
 	int openat(int dirfd, const char* path, int flags, int* fd) {
-		auto base = this->get_base(dirfd, path);
+		auto pathinfo = path_split(path);
+
+		auto base = this->get_origin(dirfd, path);
 
 		int access = flags & 0b11;
 
@@ -632,10 +611,9 @@ public:
 				return EACCES;
 			}
 
-			auto dirname = path_dirname(path);
 			Rc<Directory> loc = base;
-			if (dirname.size() > 0) {
-				auto res = Directory::find(base, dirname);
+			if (pathinfo.dir.size() > 0) {
+				auto res = Directory::find(base, pathinfo.dir);
 				if (res.is<Rc<Directory>>()) {
 					loc = res.get<Rc<Directory>>();
 				} else {
@@ -644,13 +622,14 @@ public:
 				}
 			}
 
-			file = Directory::create_file(loc, path_filename(path));
+			file = Directory::create_file(loc, pathinfo.base);
 		}
 
 		// if we're opening in truncation mode, set the size of the file to 0
 		// note that this doesn't actually modify the file buffer
 		if ((flags & O_TRUNC) && (access == O_RDWR || access == O_WRONLY)) {
-			file->truncate(0);
+			// TODO check if we can write to the file
+			int res = file->truncate(0);
 		}
 
 		*fd = this->create_entry(
@@ -665,14 +644,14 @@ public:
 	}
 
 	int mkdirat(int dirfd, const char* path) {
-		auto base = this->get_base(dirfd, path);
-		auto loc = Directory::find(base, path_dirname(path));
+		auto pathinfo = path_split(path);
+		auto origin = this->get_origin(dirfd, path);
+		auto loc = Directory::find(origin, pathinfo.dir);
 		if (loc.is<Rc<Directory>>()) {
 			auto locdir = loc.get<Rc<Directory>>();
-			// TODO remove trailing slash from pathname
 			// TODO check that filename isn't empty
 			// TODO chck if exists 
-			Directory::create_dir(locdir, path_filename(path));
+			Directory::create_dir(locdir, pathinfo.base);
 			return 0;
 		} else {
 			// TODO correct error code
@@ -681,16 +660,17 @@ public:
 	}
 
 	int unlinkat(int dirfd, const char* path, int flags) {
-		auto base = this->get_base(dirfd, path);
-		auto loc = Directory::find(base, path_dirname(path));
+		auto pathinfo = path_split(path);
+		auto origin = this->get_origin(dirfd, path);
+		auto loc = Directory::find(origin, pathinfo.dir);
 		if (loc.is<Rc<Directory>>()) {
 			auto locdir = loc.get<Rc<Directory>>();
-			// TODO remove trailing slash from pathname
-			// TODO check that filename isn't empty
 			if (flags & AT_REMOVEDIR) {
-				return Directory::remove_dir(locdir, path_filename(path));
+				return Directory::remove_dir(locdir, pathinfo.base);
+			} else if (!pathinfo.is_dir) {
+				return Directory::remove_file(locdir, pathinfo.base);
 			} else {
-				return Directory::remove_file(locdir, path_filename(path));
+				return EISDIR;
 			}
 		} else if (loc.is<Rc<File>>()) {
 			return ENOTDIR;
@@ -699,25 +679,35 @@ public:
 		}
 	}
 
+	int linkat(int old_dirfd, const char* old_path, int new_dirfd, const char* new_path, int flags) {
+		return ENOSYS;
+	}
+
+	int renameat(int old_dirfd, const char* old_path, int new_dirfd, const char* new_path) {
+		return ENOSYS;
+	}
+
 	int fcntl(int fd, int cmd, int arg, int* result) {
-		auto entry = this->get(fd);
-		if (entry == nullptr) {
-			return EBADF;
-		}
-		auto file = entry->get_file();
-		if (file == nullptr) {
-			return EISDIR;
-		}
-		switch (cmd) {
-			case F_GETFL:
-				*result = file->get_flags();
-				return 0;
-			case F_SETFL:
-				file->set_flags(arg);
-				return 0;
-			default:
-				return EINVAL;
-		}
+		return ENOSYS;
+		// auto entry = this->get(fd);
+		// if (entry == nullptr) {
+		// 	return EBADF;
+		// }
+		// auto file = entry->get_file();
+		// if (file == nullptr) {
+		// 	return EISDIR;
+		// }
+		// // TODO implement more commands
+		// switch (cmd) {
+		// 	case F_GETFL:
+		// 		*result = file->get_flags();
+		// 		return 0;
+		// 	case F_SETFL:
+		// 		file->set_flags(arg);
+		// 		return 0;
+		// 	default:
+		// 		return EINVAL;
+		// }
 	}
 
 	Rc<FileTableEntry> get(int fd) {
@@ -764,6 +754,39 @@ FileTable& get_file_table() {
 }
 
 };
+
+int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
+	auto ret = do_cp_syscall(SYS_read, fd, buffer, size);
+	if(int e = sc_error(ret); e)
+		return e;
+	*bytes_read = sc_int_result<ssize_t>(ret);
+	return 0;
+}
+
+int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
+	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
+	if(int e = sc_error(ret); e)
+		return e;
+	*bytes_written = sc_int_result<ssize_t>(ret);
+	return 0;
+}
+
+int sys_vm_map(void *hint, size_t size, int prot, int flags,
+		int fd, off_t offset, void **window) {
+	auto ret = do_syscall(SYS_mmap, hint, size, prot, flags, fd, offset);
+	// TODO: musl fixes up EPERM errors from the kernel.
+	if(int e = sc_error(ret); e)
+		return e;
+	*window = sc_ptr_result<void>(ret);
+	return 0;
+}
+
+int sys_vm_unmap(void *pointer, size_t size) {
+	auto ret = do_syscall(SYS_munmap, pointer, size);
+	if(int e = sc_error(ret); e)
+		return e;
+	return 0;
+}
 
 void sys_libc_log(const char *message) {
 	size_t n = 0;
@@ -839,28 +862,12 @@ int sys_read(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
 	return file->read(buffer ,size, bytes_read);
 }
 
-int sys_read_old(int fd, void *buffer, size_t size, ssize_t *bytes_read) {
-	auto ret = do_cp_syscall(SYS_read, fd, buffer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_read = sc_int_result<ssize_t>(ret);
-	return 0;
-}
-
 int sys_write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
 	auto file = vfs::get_file_table().get(fd);
 	if (file == nullptr) {
 		return EBADF;
 	}
 	return file->write(buffer, size, bytes_written);
-}
-
-int sys_write_old(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_written = sc_int_result<ssize_t>(ret);
-	return 0;
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
@@ -872,53 +879,27 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
 }
 
 int sys_chmod(const char *pathname, mode_t mode) {
-	(void)pathname;
-	(void)mode;
+	(void)pathname, (void)mode;
 	return 0;
 }
 
 int sys_fchmod(int fd, mode_t mode) {
-	(void)fd;
-	(void)mode;
+	(void)fd, (void)mode;
 	return 0;
 }
 
 int sys_fchmodat(int fd, const char *pathname, mode_t mode, int flags) {
-	(void)fd;
-	(void)pathname;
-	(void)mode;
-	(void)flags;
+	(void)fd, (void)pathname, (void)mode, (void)flags;
 	return 0;
 }
 
 int sys_fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags) {
-	(void)dirfd;
-	(void)pathname;
-	(void)owner;
-	(void)group;
-	(void)flags;
+	(void)dirfd, (void)pathname, (void)owner, (void)group, (void)flags;
 	return 0;
 }
 
 int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
 	(void)dirfd, (void)pathname, (void)times, (void)flags;
-	return 0;
-}
-
-int sys_vm_map(void *hint, size_t size, int prot, int flags,
-		int fd, off_t offset, void **window) {
-	auto ret = do_syscall(SYS_mmap, hint, size, prot, flags, fd, offset);
-	// TODO: musl fixes up EPERM errors from the kernel.
-	if(int e = sc_error(ret); e)
-		return e;
-	*window = sc_ptr_result<void>(ret);
-	return 0;
-}
-
-int sys_vm_unmap(void *pointer, size_t size) {
-	auto ret = do_syscall(SYS_munmap, pointer, size);
-	if(int e = sc_error(ret); e)
-		return e;
 	return 0;
 }
 
@@ -942,6 +923,7 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
+	// SYS_newfstatat
 	if (fsfdt == fsfd_target::path)
 		fd = AT_FDCWD;
 	else if (fsfdt == fsfd_target::fd)
@@ -949,10 +931,6 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat
 	else
 		__ensure(fsfdt == fsfd_target::fd_path);
 	return EACCES;
-	// auto ret = do_cp_syscall(SYS_newfstatat, fd, path, statbuf, flags);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
@@ -972,33 +950,6 @@ int sys_sigaction(int signum, const struct sigaction *act,
 	(void)signum, (void)act, (void)oldact;
 	// pretend that we installed the signal handler
 	return 0; 
-	// struct ksigaction {
-	// 	void (*handler)(int);
-	// 	unsigned long flags;
-	// 	void (*restorer)(void);
-	// 	sigset_t mask;
-	// };
-
-	// struct ksigaction kernel_act, kernel_oldact;
-	// if (act) {
-	// 	kernel_act.handler = act->sa_handler;
-	// 	kernel_act.flags = act->sa_flags | SA_RESTORER;
-	// 	kernel_act.restorer = __mlibc_signal_restore;
-	// 	kernel_act.mask = act->sa_mask;
-	// }
-    //     auto ret = do_syscall(SYS_rt_sigaction, signum, act ?
-	// 		&kernel_act : NULL, oldact ?
-	// 		&kernel_oldact : NULL, sizeof(sigset_t));
-    //     if (int e = sc_error(ret); e)
-    //             return e;
-
-	// if (oldact) {
-	// 	oldact->sa_handler = kernel_oldact.handler;
-	// 	oldact->sa_flags = kernel_oldact.flags;
-	// 	oldact->sa_restorer = kernel_oldact.restorer;
-	// 	oldact->sa_mask = kernel_oldact.mask;
-	// }
-    //     return 0;
 }
 
 int sys_socket(int domain, int type, int protocol, int *fd) {
@@ -1031,13 +982,15 @@ int sys_fcntl(int fd, int cmd, va_list args, int *result) {
 }
 
 int sys_getcwd(char *buf, size_t size) {
-	const char* cwd = vfs::get_file_table().get_cwd();
-	size_t cwd_len = strlen(cwd) + 1;
-	if (size < cwd_len) {
-		return ERANGE;
-	}
-	strcpy(buf, cwd);
-	return 0;
+	// TODO implement this
+	return ENOSYS;
+	// const char* cwd = vfs::get_file_table().get_cwd();
+	// size_t cwd_len = strlen(cwd) + 1;
+	// if (size < cwd_len) {
+	// 	return ERANGE;
+	// }
+	// strcpy(buf, cwd);
+	// return 0;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {
@@ -1081,36 +1034,13 @@ int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
                 fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask, int *num_events) {
-	// The Linux kernel really wants 7 arguments, even tho this is not supported
-	// To fix that issue, they use a struct as the last argument.
-	// See the man page of pselect and the glibc source code
-	struct {
-			sigset_t ss;
-			size_t ss_len;
-	} data;
-	data.ss = (uintptr_t)sigmask;
-	data.ss_len = NSIG / 8;
-
-	auto ret = do_cp_syscall(SYS_pselect6, nfds, readfds, writefds,
-					exceptfds, timeout, &data);
-	if (int e = sc_error(ret); e)
-			return e;
-	*num_events = sc_int_result<int>(ret);
-	return 0;
+	return ENOSYS;
 }
 
 int sys_pipe(int *fds, int flags) {
-	if(flags) {
-		auto ret = do_syscall(SYS_pipe2, fds, flags);
-		if (int e = sc_error(ret); e)
-				return e;
-		return 0;
-	} else {
-		auto ret = do_syscall(SYS_pipe2, fds, 0);
-		if (int e = sc_error(ret); e)
-				return e;
-		return 0;
-	}
+	// TODO we might want to support pipes. It should be relatively simple to implement,
+	// but it is unclear whether many single-process applications actually use it.
+	return ENOSYS;
 }
 
 int sys_fork(pid_t *child) {
@@ -1163,27 +1093,29 @@ int sys_sysinfo(struct sysinfo *info) {
 void sys_yield() {}
 
 int sys_clone(void *tcb, pid_t *pid_out, void *stack) {
-	unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
-		| CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_SETTLS
-		| CLONE_PARENT_SETTID;
+	(void)tcb, (void)pid_out, (void)stack;
+	return ENOSYS;
+// 	unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
+// 		| CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_SETTLS
+// 		| CLONE_PARENT_SETTID;
 
-#if defined(__riscv)
-	// TP should point to the address immediately after the TCB.
-	// TODO: We should change the sysdep so that we don't need to do this.
-	auto tls = reinterpret_cast<char *>(tcb) + sizeof(Tcb);
-	tcb = reinterpret_cast<void *>(tls);
-#elif defined(__aarch64__)
-	// TP should point to the address 16 bytes before the end of the TCB.
-	// TODO: We should change the sysdep so that we don't need to do this.
-	auto tp = reinterpret_cast<char *>(tcb) + sizeof(Tcb) - 0x10;
-	tcb = reinterpret_cast<void *>(tp);
-#endif
+// #if defined(__riscv)
+// 	// TP should point to the address immediately after the TCB.
+// 	// TODO: We should change the sysdep so that we don't need to do this.
+// 	auto tls = reinterpret_cast<char *>(tcb) + sizeof(Tcb);
+// 	tcb = reinterpret_cast<void *>(tls);
+// #elif defined(__aarch64__)
+// 	// TP should point to the address 16 bytes before the end of the TCB.
+// 	// TODO: We should change the sysdep so that we don't need to do this.
+// 	auto tp = reinterpret_cast<char *>(tcb) + sizeof(Tcb) - 0x10;
+// 	tcb = reinterpret_cast<void *>(tp);
+// #endif
 
-	auto ret = __mlibc_spawn_thread(flags, stack, pid_out, NULL, tcb);
-	if (ret < 0)
-		return ret;
+// 	auto ret = __mlibc_spawn_thread(flags, stack, pid_out, NULL, tcb);
+// 	if (ret < 0)
+// 		return ret;
 
-        return 0;
+//         return 0;
 }
 
 extern "C" const char __mlibc_syscall_begin[1];
@@ -1215,54 +1147,36 @@ int sys_tgkill(int tgid, int tid, int sig) {
 }
 
 int sys_tcgetattr(int fd, struct termios *attr) {
-	auto ret = do_syscall(SYS_ioctl, fd, TCGETS, attr);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)attr;
+	return ENOSYS;
 }
 
 int sys_tcsetattr(int fd, int optional_action, const struct termios *attr) {
-	int req;
-
-	switch (optional_action) {
-		case TCSANOW: req = TCSETS; break;
-		case TCSADRAIN: req = TCSETSW; break;
-		case TCSAFLUSH: req = TCSETSF; break;
-		default: return EINVAL;
-	}
-
-	auto ret = do_syscall(SYS_ioctl, fd, req, attr);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)optional_action, (void)attr;
+	return ENOSYS;
 }
 
 int sys_tcdrain(int fd) {
-	auto ret = do_syscall(SYS_ioctl, fd, TCSBRK, 1);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd;
+	return ENOSYS;
 }
 
 int sys_tcflow(int fd, int action) {
-	auto ret = do_syscall(SYS_ioctl, fd, TCXONC, action);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)action;
+	return ENOSYS;
 }
 
 int sys_access(const char *path, int mode) {
-	auto ret = do_syscall(SYS_faccessat, AT_FDCWD, path, mode, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return sys_faccessat(AT_FDCWD, path, mode, 0);
 }
 
 int sys_faccessat(int dirfd, const char *pathname, int mode, int flags) {
-	auto ret = do_syscall(SYS_faccessat, dirfd, pathname, mode, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	int fd;
+	auto ret = sys_openat(dirfd, pathname, flags, mode, &fd);
+	if (ret == 0) {
+		sys_close(fd);
+	} 
+	return ret;
 }
 
 int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length) {
@@ -1285,27 +1199,19 @@ int sys_setsockopt(int fd, int layer, int number, const void *buffer, socklen_t 
 
 int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
-	auto ret = do_syscall(SYS_getsockname, fd, addr_ptr, &max_addr_length);
-	if (int e = sc_error(ret); e)
-		return e;
-	*actual_length = max_addr_length;
-	return 0;
+	(void)fd, (void)addr_ptr, (void)max_addr_length, (void)actual_length;
+	return EBADF;
 }
 
 int sys_peername(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
 		socklen_t *actual_length) {
-	auto ret = do_syscall(SYS_getpeername, fd, addr_ptr, &max_addr_length);
-	if (int e = sc_error(ret); e)
-		return e;
-	*actual_length = max_addr_length;
-	return 0;
+	(void)fd, (void)addr_ptr, (void)max_addr_length, (void)actual_length;
+	return EBADF;
 }
 
 int sys_listen(int fd, int backlog) {
-	auto ret = do_syscall(SYS_listen, fd, backlog, 0, 0, 0, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)fd, (void)backlog;
+	return EBADF;
 }
 
 int sys_getpriority(int which, id_t who, int *value) {
@@ -1343,78 +1249,61 @@ int sys_open_dir(const char *path, int *fd) {
 }
 
 int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
-	auto ret = do_syscall(SYS_getdents64, handle, buffer, max_size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_read = sc_int_result<int>(ret);
-	return 0;
+	auto entry = vfs::get_file_table().get(handle);
+	if (entry == nullptr) {
+		return EBADF;
+	}
+	return entry->read_entries(buffer, max_size, bytes_read);
 }
 
 int sys_prctl(int op, va_list ap, int *out) {
-	unsigned long x[4];
-	for(int i = 0; i < 4; i++)
-		x[i] = va_arg(ap, unsigned long);
-
-	auto ret = do_syscall(SYS_prctl, op, x[0], x[1], x[2], x[3]);
-	if (int e = sc_error(ret); e)
-		return e;
-	*out = sc_int_result<int>(ret);
-	return 0;
+	(void)op, (void)ap, (void)out;
+	return EINVAL;
 }
 
 int sys_uname(struct utsname *buf) {
-	auto ret = do_syscall(SYS_uname, buf);
-	if (int e = sc_error(ret); e)
-		return e;
+	memset(buf, 0, sizeof(*buf));
 	return 0;
 }
 
 int sys_gethostname(char *buf, size_t bufsize) {
-	struct utsname uname_buf;
-	if (auto e = sys_uname(&uname_buf); e)
-		return e;
-
-	auto node_len = strlen(uname_buf.nodename);
-	if (node_len >= bufsize)
-		return ENAMETOOLONG;
-
-	memcpy(buf, uname_buf.nodename, node_len);
-	buf[node_len] = '\0';
-	return 0;
+	(void)buf, (void)bufsize;
+	return ENAMETOOLONG;
 }
 
 int sys_pread(int fd, void *buf, size_t n, off_t off, ssize_t *bytes_read) {
-	auto ret = do_syscall(SYS_pread64, fd, buf, n, off);
-	if (int e = sc_error(ret); e)
-		return e;
-	*bytes_read = sc_int_result<ssize_t>(ret);
-	return 0;
+	auto entry = vfs::get_file_table().get(fd);
+	if (entry == nullptr) {
+		return EBADF;
+	}
+	auto file = entry->get_file();
+	if (file == nullptr) {
+		return EISDIR;
+	}
+	return file->read_offset(buf, n, off, bytes_read);
 }
 
 int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_written) {
-	auto ret = do_syscall(SYS_pwrite64, fd, buf, n, off);
-	if (int e = sc_error(ret); e)
-		return e;
-	*bytes_written = sc_int_result<ssize_t>(ret);
-	return 0;
+	auto entry = vfs::get_file_table().get(fd);
+	if (entry == nullptr) {
+		return EBADF;
+	}
+	auto file = entry->get_file();
+	if (file == nullptr) {
+		return EISDIR;
+	}
+	return file->write_offset(buf, n, off, bytes_written);
 }
 
 int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
-	struct timespec tm;
-	tm.tv_sec = timeout / 1000;
-	tm.tv_nsec = timeout % 1000 * 1000000;
-	auto ret = do_syscall(SYS_ppoll, fds, count, timeout >= 0 ? &tm : nullptr, 0, NSIG / 8);
-	if (int e = sc_error(ret); e)
-		return e;
-	*num_events = sc_int_result<int>(ret);
-	return 0;
+	// NOTE timeout is specified in milliseconds
+	return ENOSYS;
 }
 
 int sys_getrusage(int scope, struct rusage *usage) {
-	auto ret = do_syscall(SYS_getrusage, scope, usage);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)scope, (void)usage;
+	// TODO this might be useful to implement
+	return ENOSYS;
 }
 
 int sys_madvise(void *addr, size_t length, int advice) {
@@ -1433,10 +1322,8 @@ int sys_reboot(int cmd) {
 }
 
 int sys_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
-	auto ret = do_syscall(SYS_sched_getaffinity, pid, cpusetsize, mask);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)pid, (void)cpusetsize, (void)mask;
+	return ENOSYS;
 }
 
 int sys_mount(const char *source, const char *target,
@@ -1451,73 +1338,71 @@ int sys_umount2(const char *target, int flags) {
 }
 
 int sys_sethostname(const char *buffer, size_t bufsize) {
-	auto ret = do_syscall(SYS_sethostname, buffer, bufsize);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)buffer, (void)bufsize;
+	return EPERM;
 }
 
-int sys_epoll_create(int flags, int *fd) {
-	auto ret = do_syscall(SYS_epoll_create1, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_epoll_create(int flags, int *fd) {
+// 	auto ret = do_syscall(SYS_epoll_create1, flags);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*fd = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
-int sys_epoll_ctl(int epfd, int mode, int fd, struct epoll_event *ev) {
-	auto ret = do_syscall(SYS_epoll_ctl, epfd, mode, fd, ev);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
-}
+// int sys_epoll_ctl(int epfd, int mode, int fd, struct epoll_event *ev) {
+// 	auto ret = do_syscall(SYS_epoll_ctl, epfd, mode, fd, ev);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	return 0;
+// }
 
-int sys_epoll_pwait(int epfd, struct epoll_event *ev, int n, int timeout, const sigset_t *sigmask, int *raised) {
-	auto ret = do_syscall(SYS_epoll_pwait, epfd, ev, n, timeout, sigmask, NSIG / 8);
-	if (int e = sc_error(ret); e)
-		return e;
-	*raised = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_epoll_pwait(int epfd, struct epoll_event *ev, int n, int timeout, const sigset_t *sigmask, int *raised) {
+// 	auto ret = do_syscall(SYS_epoll_pwait, epfd, ev, n, timeout, sigmask, NSIG / 8);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*raised = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
-int sys_eventfd_create(unsigned int initval, int flags, int *fd) {
-	auto ret = do_syscall(SYS_eventfd2, initval, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_eventfd_create(unsigned int initval, int flags, int *fd) {
+// 	auto ret = do_syscall(SYS_eventfd2, initval, flags);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*fd = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
-int sys_signalfd_create(const sigset_t *masks, int flags, int *fd) {
-	auto ret = do_syscall(SYS_signalfd4, *fd, masks, sizeof(sigset_t), flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_signalfd_create(const sigset_t *masks, int flags, int *fd) {
+// 	auto ret = do_syscall(SYS_signalfd4, *fd, masks, sizeof(sigset_t), flags);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*fd = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
-int sys_timerfd_create(int clockid, int flags, int *fd) {
-	auto ret = do_syscall(SYS_timerfd_create, clockid, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_timerfd_create(int clockid, int flags, int *fd) {
+// 	auto ret = do_syscall(SYS_timerfd_create, clockid, flags);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*fd = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
-int sys_timerfd_settime(int fd, int flags, const struct itimerspec *value, struct itimerspec *oldvalue) {
-	auto ret = do_syscall(SYS_timerfd_settime, fd, flags, value, oldvalue);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
-}
+// int sys_timerfd_settime(int fd, int flags, const struct itimerspec *value, struct itimerspec *oldvalue) {
+// 	auto ret = do_syscall(SYS_timerfd_settime, fd, flags, value, oldvalue);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	return 0;
+// }
 
-int sys_inotify_create(int flags, int *fd) {
-	auto ret = do_syscall(SYS_inotify_init1, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*fd = sc_int_result<int>(ret);
-	return 0;
-}
+// int sys_inotify_create(int flags, int *fd) {
+// 	auto ret = do_syscall(SYS_inotify_init1, flags);
+// 	if (int e = sc_error(ret); e)
+// 		return e;
+// 	*fd = sc_int_result<int>(ret);
+// 	return 0;
+// }
 
 int sys_init_module(void *module, unsigned long length, const char *args) {
 	(void)module, (void)length, (void)args;
@@ -1542,10 +1427,8 @@ int sys_getcpu(int *cpu) {
 }
 
 int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) {
-	auto ret = do_syscall(SYS_socketpair, domain, type_and_flags, proto, fds, 0, 0);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)domain, (void)type_and_flags, (void)proto, (void)fds;
+	return EPROTONOSUPPORT;
 }
 
 int sys_getsockopt(int fd, int layer, int number, void *__restrict buffer, socklen_t *__restrict size) {
@@ -1620,9 +1503,7 @@ int sys_kill(int pid, int sig) {
 }
 
 int sys_vm_protect(void *pointer, size_t size, int prot) {
-	auto ret = do_syscall(SYS_mprotect, pointer, size, prot);
-	if (int e = sc_error(ret); e)
-		return e;
+	(void)pointer, (void)size, (void)prot;
 	return 0;
 }
 
@@ -1655,19 +1536,11 @@ int sys_futex_wait(int *pointer, int expected, const struct timespec *time) {
 	} else {
 		return EINTR;
 	}
-	// auto ret = do_cp_syscall(SYS_futex, pointer, FUTEX_WAIT, expected, time);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_futex_wake(int *pointer) {
 	(void)pointer;
 	return 0;
-	// auto ret = do_syscall(SYS_futex, pointer, FUTEX_WAKE, INT_MAX);
-	// if (int e = sc_error(ret); e)
-	// 	return e;
-	// return 0;
 }
 
 int sys_sigsuspend(const sigset_t *set) {
@@ -1692,28 +1565,34 @@ int sys_mkdirat(int dirfd, const char *path, mode_t mode) {
 }
 
 int sys_mknodat(int dirfd, const char *path, int mode, int dev) {
-	auto ret = do_syscall(SYS_mknodat, dirfd, path, mode, dev);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)dev;
+	// TODO: handle permissions
+	if (mode & S_IFREG) {
+		auto& tab = vfs::get_file_table();
+		int fd = 0;
+		int res = tab.openat(dirfd, path, O_CREAT | O_EXCL, &fd);
+		if (!res) {
+			tab.close(fd);
+		}
+		return res;
+	} else if (mode & S_IFDIR) {
+		return mkdirat(dirfd, path, 0);
+	} else {
+		return EINVAL;
+	}
 }
 
 int sys_mkfifoat(int dirfd, const char *path, int mode) {
-	return sys_mknodat(dirfd, path, mode | S_IFIFO, 0);
+	(void)dirfd, (void)path, (void)mode;
+	return ENOSYS;
 }
 
 int sys_symlink(const char *target_path, const char *link_path) {
-	auto ret = do_syscall(SYS_symlinkat, target_path, AT_FDCWD, link_path);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return ENOSYS;
 }
 
 int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
-	auto ret = do_syscall(SYS_symlinkat, target_path, dirfd, link_path);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return ENOSYS;
 }
 
 int sys_umask(mode_t mode, mode_t *old) {
@@ -1723,20 +1602,11 @@ int sys_umask(mode_t mode, mode_t *old) {
 }
 
 int sys_chdir(const char *path) {
-	return vfs::get_file_table().set_cwd(path);
+	return vfs::get_file_table().set_cwd(AT_FDCWD, path);
 }
 
 int sys_fchdir(int fd) {
-	return EBADF;
-	// auto* entry = vfs::get_file_table().get(fd);
-	// if (entry == nullptr) {
-	// 	return EBADF;
-	// }
-	// auto* path = entry->get_dirpath();
-	// if (path == nullptr) {
-	// 	return ENOTDIR;
-	// }
-	// return sys_chdir(path);
+	return vfs::get_file_table().set_cwd(fd, "");
 }
 
 int sys_rename(const char *old_path, const char *new_path) {
@@ -1744,14 +1614,15 @@ int sys_rename(const char *old_path, const char *new_path) {
 }
 
 int sys_renameat(int old_dirfd, const char *old_path, int new_dirfd, const char *new_path) {
-#ifdef SYS_renameat2
-	auto ret = do_syscall(SYS_renameat2, old_dirfd, old_path, new_dirfd, new_path, 0);
-#else
-	auto ret = do_syscall(SYS_renameat, old_dirfd, old_path, new_dirfd, new_path);
-#endif /* defined(SYS_renameat2) */
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	return vfs::get_file_table().renameat(old_dirfd, old_path, new_dirfd, new_path);
+}
+
+int sys_link(const char *old_path, const char *new_path) {
+	return sys_linkat(AT_FDCWD, old_path, AT_FDCWD, new_path, 0);
+}
+
+int sys_linkat(int olddirfd, const char *old_path, int newdirfd, const char *new_path, int flags) {
+	return vfs::get_file_table().linkat(olddirfd, old_path, newdirfd, new_path, flags);
 }
 
 int sys_rmdir(const char *path) {
@@ -1759,25 +1630,26 @@ int sys_rmdir(const char *path) {
 }
 
 int sys_ftruncate(int fd, size_t size) {
-	auto ret = do_syscall(SYS_ftruncate, fd, size);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	auto val = vfs::get_file_table().get(fd);
+	if (val == nullptr) {
+		return EBADF;
+	}
+	auto file = val->get_file();
+	if (file == nullptr) {
+		return EBADF;
+	}
+	return file->truncate(size);
 }
 
 int sys_readlink(const char *path, void *buf, size_t bufsiz, ssize_t *len) {
-	auto ret = do_syscall(SYS_readlinkat, AT_FDCWD, path, buf, bufsiz);
-	if (int e = sc_error(ret); e)
-		return e;
-	*len = sc_int_result<ssize_t>(ret);
-	return 0;
+	// TODO implement once we have symlinks
+	return ENOSYS;
 }
 
 int sys_getrlimit(int resource, struct rlimit *limit) {
-	auto ret = do_syscall(SYS_getrlimit, resource, limit);
-	if (int e = sc_error(ret); e)
-		return e;
-	return 0;
+	(void)resource, (void)limit;
+	// TODO this might be useful to implement
+	return ENOSYS;
 }
 
 int sys_setrlimit(int resource, const struct rlimit *limit) {

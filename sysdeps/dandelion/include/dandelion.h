@@ -13,7 +13,6 @@ struct io_buf {
 
 	void* buffer;
 	size_t size;
-	size_t capacity;
 };
 
 struct io_set {
@@ -28,8 +27,8 @@ struct dandelion {
 	io_buf stdout;
 	io_buf stderr;
 
-	io_set root_input_set;
-	io_set root_output_set;
+	io_set input_root;
+	io_set output_root;
 };
 
 extern struct dandelion dandelion;
