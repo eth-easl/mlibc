@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#define FILE_COUNT 1000
+
 const char teststr[] = "Hello world";
 
 void print_dir_entries(DIR* dir) {
@@ -14,9 +16,21 @@ void print_dir_entries(DIR* dir) {
     }
 }
 
+void assert_dir_entry_count(DIR* dir, int n) {
+    // checks that dir has n entries
+    rewinddir(dir);
+    int count = 0;
+    for (struct dirent* ent = readdir(dir); ent != NULL; ent = readdir(dir)) {
+        count++;
+    }
+    if (count != n) {
+        printf("expected %d entries, got %d\n", n, count);
+    }
+}
+
 // create 1000 numbered files in the directory supplied by dirfd
-void create_files(int dirfd) {
-    for (int i = 0; i < 1000; i++) {
+void create_files(int dirfd, int n) {
+    for (int i = 0; i < n; i++) {
         char buf[32];
         sprintf(buf, "%d", i);
         int fd = openat(dirfd, buf, O_CREAT | O_RDWR, 0777);
@@ -24,7 +38,29 @@ void create_files(int dirfd) {
     }
 }
 
+// prints the contents of the file referred to by fd
+void print_file(int fd) {
+    char buf[1024];
+    int n = read(fd, buf, sizeof(buf));
+    buf[n] = '\0';
+    printf("%s\n", buf);
+}
+
+void dump(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return;
+    }
+    printf("== Start of file %s ==\n", path);
+    print_file(fd);
+    printf("==   End of file %s ==\n", path);
+    close(fd);
+}
+
 int main() {
+    dump("input.txt");
+
     mkdir("foo", 0777);
     int dirfd = open("foo", O_RDONLY);
     int fd1 = openat(dirfd, "bar", O_CREAT | O_RDWR, 0777);
@@ -38,7 +74,7 @@ int main() {
     close(dirfd);
 
     int dir2fd = open("foo/qux", O_RDONLY);
-    create_files(dir2fd);
+    create_files(dir2fd, FILE_COUNT);
 
     // print all entries in "foo"
     DIR* dir = opendir("foo");
@@ -46,9 +82,7 @@ int main() {
         perror("open foo");
         return 1;
     } else {
-        print_dir_entries(dir);
-        rewinddir(dir);
-        print_dir_entries(dir);
+        assert_dir_entry_count(dir, 3);
     }
 
     close(dir2fd);
@@ -58,18 +92,12 @@ int main() {
         perror("open foo/qux");
         return 1;
     } else {
-        print_dir_entries(dir2);
+        assert_dir_entry_count(dir2, FILE_COUNT);
         closedir(dir2);
     }
 
 
-    int fd3 = open("foo/bar", O_RDONLY);
-    // print contents of fd3
-    char buf[1024];
-    int n = read(fd3, buf, sizeof(buf));
-    buf[n] = '\0';
-    printf("fd3: %s, n: %d\n", buf, n);
-    close(fd3);
+    dump("foo/bar");
 
     int res = remove("foo/bar");
     if (res != 0) {

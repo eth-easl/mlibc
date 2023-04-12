@@ -26,9 +26,6 @@
 
 #include <dandelion.h>
 
-#define STUB_ONLY { __ensure(!"STUB_ONLY function was called"); __builtin_unreachable(); }
-#define UNUSED(x) (void)(x);
-
 #ifndef MLIBC_BUILDING_RTDL
 extern "C" long __do_syscall_ret(unsigned long ret) {
 	if(ret > -4096UL) {
@@ -179,7 +176,7 @@ class Directory {
 	}
 
 	static size_t file_offset(size_t offset) {
-		return offset & static_cast<uint32_t>(~1);
+		return offset & static_cast<uint32_t>(~0);
 	}
 
 	static size_t dir_offset(size_t offset) {
@@ -330,8 +327,8 @@ class FileTableEntry {
 public:
 	struct OpenFile {
 		Rc<File> data;
-		size_t offset;
-		int flags;
+		size_t offset{0};
+		int flags{0};
 
 		int access() {
 			return this->flags & 0b11;
@@ -340,7 +337,7 @@ public:
 
 	struct OpenDir {
 		Rc<Directory> dir;
-		size_t offset;
+		size_t offset{0};
 	};
 private:
 
@@ -475,6 +472,25 @@ path_split_result path_split(frg::string_view path) {
 	};
 }
 
+class PathComponents {
+	frg::string_view path;
+public:
+	PathComponents(frg::string_view path) : path(path) {}
+	frg::string_view next() {
+		size_t start_idx = 0;
+		while (start_idx < path.size() && path[start_idx] == '/') {
+			++start_idx;
+		}
+		size_t end_idx = start_idx;
+		while (end_idx < path.size() && path[end_idx] != '/') {
+			++end_idx;
+		}
+		auto ret = path.sub_string(start_idx, end_idx - start_idx);
+		path = path.sub_string(end_idx, path.size() - end_idx);
+		return ret;
+	}
+};
+
 class FileTable {
 	frg::vector<Rc<FileTableEntry>, MemoryAllocator> open_files{getAllocator()};
 	Rc<Directory> working_dir;
@@ -539,14 +555,41 @@ class FileTable {
 		return base;
 	}
 
+	int create_file_from_buf(const char* set_ident, io_buf* buf) {
+		auto path = string{set_ident, getAllocator()} + string{buf->ident, getAllocator()};
+		auto pathinfo = path_split(path);
+		PathComponents components{pathinfo.dir};
+
+		auto current = this->fs_root;
+		for (auto component = components.next(); component.size() > 0; component = components.next()) {
+			auto next = Directory::find(current, component);
+			if (next.is<Rc<Directory>>()) {
+				current = next.get<Rc<Directory>>();
+			} else if (next.is<NoEntry>()) {
+				current = Directory::create_dir(current, component);
+			} else {
+				return 1;
+			}
+		}
+
+		auto file = Rc<File>::make(buf);
+		Directory::link_file(current, pathinfo.base, file);
+		return 0;
+	}
+
 public:
 	FileTable() {
-		// test_init_dandelion();
+		test_init_dandelion();
 
 		this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
 		this->fs_root->set_parent(this->fs_root);
 		this->working_dir = this->fs_root;
 
+		for (auto* set = &dandelion.input_root; set != nullptr; set = set->next) {
+			for (auto* buf = set->buf_head; buf != nullptr; buf = buf->next) {
+				create_file_from_buf(set->ident, buf);
+			}
+		}
 
 		this->create_entry_at(0,
 			FileTableEntry::OpenFile {
@@ -584,18 +627,26 @@ public:
 	int openat(int dirfd, const char* path, int flags, int* fd) {
 		auto pathinfo = path_split(path);
 
-		auto base = this->get_origin(dirfd, path);
+		auto origin = this->get_origin(dirfd, path);
 
 		int access = flags & 0b11;
 
-		auto res = Directory::find(base, path);
+		auto res = Directory::find(origin, path);
 
 		if (res.is<Rc<Directory>>()) {
+			if (access != O_RDONLY) {
+				*fd = -1;
+				return EISDIR;
+			}
+
 			auto dir = res.get<Rc<Directory>>();
 
 			*fd = this->create_entry(FileTableEntry::OpenDir{dir});
 			return 0;
-		} 
+		} else if (flags & O_DIRECTORY) {
+			*fd = -1;
+			return ENOTDIR;
+		}
 
 		Rc<File> file;
 		if (res.is<Rc<File>>()) {
@@ -611,9 +662,9 @@ public:
 				return EACCES;
 			}
 
-			Rc<Directory> loc = base;
+			Rc<Directory> loc = origin;
 			if (pathinfo.dir.size() > 0) {
-				auto res = Directory::find(base, pathinfo.dir);
+				auto res = Directory::find(origin, pathinfo.dir);
 				if (res.is<Rc<Directory>>()) {
 					loc = res.get<Rc<Directory>>();
 				} else {
@@ -645,6 +696,10 @@ public:
 
 	int mkdirat(int dirfd, const char* path) {
 		auto pathinfo = path_split(path);
+		// TODO more general way to handle empty paths
+		if (pathinfo.base.size() == 0) {
+			return ENOENT;
+		}
 		auto origin = this->get_origin(dirfd, path);
 		auto loc = Directory::find(origin, pathinfo.dir);
 		if (loc.is<Rc<Directory>>()) {
