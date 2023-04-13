@@ -63,11 +63,14 @@ int write_all(int fd, const void *buffer, size_t size) {
 
 void dump_io_buf(const char* setid, io_buf* buf) {
 	char tmp[256];
-	size_t setidlen = strlen(setid);
-	memcpy(tmp, setid, setidlen);
+	size_t setidlen = 0;
+	if (setid) {
+		setidlen = strlen(setid);
+		memcpy(tmp, setid, setidlen);
+	}
 	size_t identlen = 0;
 	if (buf->ident) {
-		tmp[setidlen] = '/';
+		tmp[setidlen] = ' ';
 		identlen = strlen(buf->ident);
 		memcpy(tmp + setidlen + 1, buf->ident, identlen);
 		++identlen;
@@ -76,6 +79,7 @@ void dump_io_buf(const char* setid, io_buf* buf) {
 	tmp[setidlen + identlen + 1] = '\n';
 	write_all(1, tmp, setidlen + identlen + 2);
 	write_all(1, buf->buffer, buf->size);
+	write_all(1, "\n", 1);
 }
 
 void dump_io_set(io_set* set) {
@@ -87,11 +91,12 @@ void dump_io_set(io_set* set) {
 void test_init_dandelion() {
 	static const char input_file_content[] = "This is an example input file";
 	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
+	static io_buf example_output_file{nullptr, "root_output.txt", nullptr, 0};
 	static io_set out_set{nullptr, "output", nullptr};
 
 	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
 	dandelion.input_root = {nullptr, "", &example_input_file};
-	dandelion.output_root = {&out_set, "", nullptr};
+	dandelion.output_root = {&out_set, "", &example_output_file};
 }
 
 }; // namespace debug
@@ -691,10 +696,19 @@ public:
 	}
 
 	void finalize() {
+		for (auto* buf = dandelion.output_root.buf_head; buf != nullptr; buf = buf->next) {
+			auto entry = Directory::find(this->fs_root, buf->ident);
+			if (entry.is<Rc<File>>()) {
+				auto& file = entry.get<Rc<File>>();
+				buf->buffer = file->buffer();
+				buf->size = file->size();
+			}
+		}
+
 		for (auto* set = dandelion.output_root.next; set != nullptr; set = set->next) {
 			auto entry = Directory::find(this->fs_root, set->ident);
 			if (entry.is<Rc<Directory>>()) {
-				create_bufs_from_dir(set, entry.get<Rc<Directory>>(), set->ident);
+				create_bufs_from_dir(set, entry.get<Rc<Directory>>(), "");
 			}
 		}
 
@@ -1654,7 +1668,9 @@ void sys_exit(int status) {
 	debug::dump_io_buf("stdout", &dandelion.stdout);
 	debug::dump_io_buf("stderr", &dandelion.stderr);
 
-
+	for (auto* set = &dandelion.output_root; set != nullptr; set = set->next) {
+		debug::dump_io_set(set);
+	}
 
 	do_syscall(SYS_exit_group, status);
 	__builtin_trap();

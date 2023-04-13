@@ -61,6 +61,7 @@ void dump(const char* path) {
 int main() {
     dump("input.txt");
 
+    mkdir("output", 0);
     mkdir("foo", 0777);
     int dirfd = open("foo", O_RDONLY);
     int fd1 = openat(dirfd, "bar", O_CREAT | O_RDWR, 0777);
@@ -111,7 +112,27 @@ int main() {
     //     return 1;
     // }
 
+    int outdirfd = open("output", O_RDONLY);
+    int outfd = openat(outdirfd, "out.txt", O_CREAT | O_RDWR, 0777);
+    // write "Output for testing" to outfd
+    write(outfd, "Output for testing", 18);
+
+    mkdirat(outdirfd, "subdir", 0777);
+    int out2fd = openat(outdirfd, "subdir/out2.txt", O_CREAT | O_RDWR, 0777);
+    // write "different output in subfile" to out2fd
+    write(out2fd, "different output in subfile", 27);
+    
+    close(outfd);
+    close(out2fd);
+    close(outdirfd);
+
     closedir(dir);
+
+    int rootoutfd = open("root_output.txt", O_CREAT | O_RDWR, 0777);
+    // write "root output file" to rootoutfd
+    write(rootoutfd, "root output file", 16);
+    close(rootoutfd);
+
     printf("success\n");
     return 0;
 }
