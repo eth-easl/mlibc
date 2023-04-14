@@ -1,15 +1,14 @@
 [constants]
-toolchain = '/home/gvilums/cheri/output/morello-sdk/bin'
 common_flags = ['-march=morello', '-mabi=aapcs']
 
 [binaries]
-c = toolchain / 'aarch64-unknown-freebsd-cc'
-cpp = toolchain / 'aarch64-unknown-freebsd-c++'
-ar = toolchain / 'aarch64-unknown-freebsd-ar'
-strip = toolchain / 'aarch64-unknown-freebsd-strip'
+c = 'cc'
+cpp = 'c++'
+ar = 'ar'
+strip = 'strip'
 
 [host_machine]
-system = 'ironclad'
+system = 'dandelion'
 cpu_family = 'aarch64'
 cpu = 'aarch64'
 endian = 'little'
