@@ -29,7 +29,7 @@ class Rc {
     }
 public:
     Rc() : ptr(nullptr) {}
-    Rc(nullptr_t) : ptr(nullptr) {}
+    Rc(std::nullptr_t) : ptr(nullptr) {}
 
     static auto make(auto&&... args) -> Rc<T>{
         RefCounted* ptr = static_cast<RefCounted*>(getAllocator().allocate(sizeof(RefCounted)));
@@ -87,11 +87,11 @@ public:
         return ptr != other.ptr;
     }
 
-    bool operator==(nullptr_t) const {
+    bool operator==(std::nullptr_t) const {
         return ptr == nullptr;
     }
 
-    bool operator!=(nullptr_t) const {
+    bool operator!=(std::nullptr_t) const {
         return ptr != nullptr;
     }
 

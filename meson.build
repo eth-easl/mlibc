@@ -1,7 +1,7 @@
 project('mlibc', default_options: ['warning_level=2', 'cpp_std=c++20'], version: '3.0.0')
 
 if host_machine.system() == 'dandelion' and host_machine.cpu_family() == 'aarch64'
-	add_global_arguments(['-mabi=aapcs', '-march=morello'], language: 'c')
+	add_global_arguments(['-mabi=aapcs', '-march=morello'], language: ['c', 'cpp'])
 endif
 
 fs = import('fs')
