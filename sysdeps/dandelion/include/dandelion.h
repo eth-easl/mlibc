@@ -8,7 +8,7 @@ extern "C" {
 #include <stddef.h>
 
 struct io_buf {
-	io_buf* next;
+	struct io_buf* next;
 	const char* ident;
 
 	void* buffer;
@@ -16,19 +16,24 @@ struct io_buf {
 };
 
 struct io_set {
-	io_set* next;
+	struct io_set* next;
 	const char* ident;
 
-	io_buf* buf_head;
+	struct io_buf* buf_head;
 };
 
 struct dandelion {
-	io_buf stdin;
-	io_buf stdout;
-	io_buf stderr;
+	const void * __capability return_pair;
+	int exit_code;
 
-	io_set input_root;
-	io_set output_root;
+	size_t heap_offset;
+
+	struct io_buf stdin;
+	struct io_buf stdout;
+	struct io_buf stderr;
+
+	struct io_set input_root;
+	struct io_set output_root;
 };
 
 extern struct dandelion dandelion;

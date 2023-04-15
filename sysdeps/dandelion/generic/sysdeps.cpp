@@ -41,11 +41,16 @@ namespace mlibc {
 namespace debug {
 
 int write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
+#if defined(__x86_64__)
 	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
 	if(int e = sc_error(ret); e)
 		return e;
 	*bytes_written = sc_int_result<ssize_t>(ret);
 	return 0;
+#else
+	*bytes_written = 0;
+	return -1;
+#endif
 }
 
 int write_all(int fd, const void *buffer, size_t size) {
@@ -53,7 +58,7 @@ int write_all(int fd, const void *buffer, size_t size) {
 	while (written < size) {
 		ssize_t bytes_written;
 		int e = write(fd, (const char*)buffer + written, size - written, &bytes_written);
-		if (e) {
+		if (e < 0) {
 			return e;
 		}
 		written += bytes_written;
@@ -919,21 +924,39 @@ FileTable& get_file_table() {
 
 }; // namespace vfs
 
+
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
+#if defined(__x86_64__)
 	auto ret = do_syscall(SYS_mmap, hint, size, prot, flags, fd, offset);
 	// TODO: musl fixes up EPERM errors from the kernel.
 	if(int e = sc_error(ret); e)
 		return e;
 	*window = sc_ptr_result<void>(ret);
 	return 0;
+#else
+	(void)hint, (void)prot, (void)flags, (void)fd, (void)offset;
+	static uintptr_t alloc_base = 0;
+	size_t aligned_size = ((size - 1) | 4095) + 1;
+	if (alloc_base == 0) {
+		alloc_base = (((uintptr_t)dandelion.heap_offset - 1) | 4095) + 1;
+	}
+	*window = (void*)alloc_base;
+	alloc_base += aligned_size;
+	return 0;
+#endif
 }
 
 int sys_vm_unmap(void *pointer, size_t size) {
+#if defined(__x86_64__)
 	auto ret = do_syscall(SYS_munmap, pointer, size);
 	if(int e = sc_error(ret); e)
 		return e;
 	return 0;
+#else
+	(void)pointer, (void)size;
+	return 0;
+#endif
 }
 
 void sys_libc_log(const char *message) {
@@ -1182,6 +1205,7 @@ int sys_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int sys_pselect(int nfds, fd_set *readfds, fd_set *writefds,
                 fd_set *exceptfds, const struct timespec *timeout, const sigset_t *sigmask, int *num_events) {
+	(void)nfds, (void)readfds, (void)writefds, (void)exceptfds, (void)timeout, (void)sigmask, (void)num_events;
 	return ENOSYS;
 }
 
@@ -1444,6 +1468,7 @@ int sys_pwrite(int fd, const void *buf, size_t n, off_t off, ssize_t *bytes_writ
 }
 
 int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
+	(void)fds, (void)count, (void)timeout, (void)num_events;
 	// NOTE timeout is specified in milliseconds
 	return ENOSYS;
 }
@@ -1672,8 +1697,16 @@ void sys_exit(int status) {
 		debug::dump_io_set(set);
 	}
 
-	do_syscall(SYS_exit_group, status);
-	__builtin_trap();
+	dandelion.exit_code = status;
+
+	__asm__ volatile(
+		"ldr c0, [%0] \n"
+		"ldpbr c29, [c0] \n"
+		: : "r" (&dandelion.return_pair) : "c0"
+	);
+	__builtin_unreachable();
+
+	// do_syscall(SYS_exit_group, status);
 }
 
 #endif // MLIBC_BUILDING_RTDL
