@@ -94,6 +94,7 @@ void dump_io_set(io_set* set) {
 }
 
 void test_init_dandelion() {
+#if defined(__x86_64__)
 	static const char input_file_content[] = "This is an example input file";
 	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
 	static io_buf example_output_file{nullptr, "root_output.txt", nullptr, 0};
@@ -102,6 +103,7 @@ void test_init_dandelion() {
 	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
 	dandelion.input_root = {nullptr, "", &example_input_file};
 	dandelion.output_root = {&out_set, "", &example_output_file};
+#endif
 }
 
 }; // namespace debug
@@ -1690,12 +1692,15 @@ void sys_exit(int status) {
 
 	// dump stdout file to console
 
+#if defined(__x86_64__)
 	debug::dump_io_buf("stdout", &dandelion.stdout);
 	debug::dump_io_buf("stderr", &dandelion.stderr);
 
 	for (auto* set = &dandelion.output_root; set != nullptr; set = set->next) {
 		debug::dump_io_set(set);
 	}
+	do_syscall(SYS_exit_group, status);
+#else
 
 	dandelion.exit_code = status;
 
@@ -1704,9 +1709,8 @@ void sys_exit(int status) {
 		"ldpbr c29, [c0] \n"
 		: : "r" (&dandelion.return_pair) : "c0"
 	);
+#endif
 	__builtin_unreachable();
-
-	// do_syscall(SYS_exit_group, status);
 }
 
 #endif // MLIBC_BUILDING_RTDL
