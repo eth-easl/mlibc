@@ -27,7 +27,7 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 extern "C" {
 
 // required for linking with normal gcc
-char __dso_handle;
+__attribute__((weak)) char __dso_handle;
 
 // global dandelion data visible to runtime
 struct dandelion_data __dandelion_global_data;
