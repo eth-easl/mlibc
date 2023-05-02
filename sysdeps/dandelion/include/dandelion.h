@@ -22,7 +22,7 @@ struct io_set {
 	struct io_buf* buf_head;
 };
 
-struct dandelion {
+struct dandelion_data {
 	int exit_code;
 
 	size_t heap_offset;
@@ -35,7 +35,7 @@ struct dandelion {
 	struct io_set output_root;
 };
 
-extern struct dandelion __dandelion_global_data;
+extern struct dandelion_data __dandelion_global_data;
 
 #ifdef __cplusplus
 }; // extern "C"

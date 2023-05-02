@@ -25,6 +25,7 @@
 #include <frg/hash_map.hpp>
 
 #include <dandelion.h>
+#include <runtime.hpp>
 
 #ifndef MLIBC_BUILDING_RTDL
 extern "C" long __do_syscall_ret(unsigned long ret) {
@@ -42,85 +43,12 @@ extern "C" {
 char __dso_handle;
 
 // global dandelion data visible to runtime
-struct dandelion __dandelion_global_data;
-
-// convenience alias to avoid polluting global namespace
-#define dandelion __dandelion_global_data
-
-// return address only exists for CHERI
-// TODO find a better macro to check for CHERI
-#ifndef __x86_64__
-const void * __capability __dandelion_return_address;
-#endif
+struct dandelion_data __dandelion_global_data;
 
 };
 
 namespace mlibc {
 
-namespace debug {
-
-int write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
-	if(int e = sc_error(ret); e)
-		return e;
-	*bytes_written = sc_int_result<ssize_t>(ret);
-	return 0;
-}
-
-int write_all(int fd, const void *buffer, size_t size) {
-	size_t written = 0;
-	while (written < size) {
-		ssize_t bytes_written;
-		int e = write(fd, (const char*)buffer + written, size - written, &bytes_written);
-		if (e < 0) {
-			return e;
-		}
-		written += bytes_written;
-	}
-	return 0;
-}
-
-void dump_io_buf(const char* setid, io_buf* buf) {
-	char tmp[256];
-	size_t setidlen = 0;
-	if (setid) {
-		setidlen = strlen(setid);
-		memcpy(tmp, setid, setidlen);
-	}
-	size_t identlen = 0;
-	if (buf->ident) {
-		tmp[setidlen] = ' ';
-		identlen = strlen(buf->ident);
-		memcpy(tmp + setidlen + 1, buf->ident, identlen);
-		++identlen;
-	}
-	tmp[setidlen + identlen] = ':';
-	tmp[setidlen + identlen + 1] = '\n';
-	write_all(1, tmp, setidlen + identlen + 2);
-	write_all(1, buf->buffer, buf->size);
-	write_all(1, "\n", 1);
-}
-
-void dump_io_set(io_set* set) {
-	for (io_buf* buf = set->buf_head; buf; buf = buf->next) {
-		dump_io_buf(set->ident, buf);
-	}
-}
-
-void test_init_dandelion() {
-#if defined(__x86_64__)
-	static const char input_file_content[] = "This is an example input file";
-	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
-	static io_buf example_output_file{nullptr, "root_output.txt", nullptr, 0};
-	static io_set out_set{nullptr, "output", nullptr};
-
-	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
-	dandelion.input_root = {nullptr, "", &example_input_file};
-	dandelion.output_root = {&out_set, "", &example_output_file};
-#endif
-}
-
-}; // namespace debug
 
 namespace vfs {
 
@@ -682,8 +610,6 @@ class FileTable {
 
 public:
 	FileTable() {
-		debug::test_init_dandelion();
-
 		this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
 		this->fs_root->set_parent(this->fs_root);
 		this->working_dir = this->fs_root;
@@ -1705,25 +1631,13 @@ void sys_exit(int status) {
 	// serialize all files to dandelion io structure
 	vfs::get_file_table().finalize();
 
+	dandelion.exit_code = status;
+
 	// dump stdout file to console
 
 #if defined(__x86_64__)
-	debug::dump_io_buf("stdout", &dandelion.stdout);
-	debug::dump_io_buf("stderr", &dandelion.stderr);
-
-	for (auto* set = &dandelion.output_root; set != nullptr; set = set->next) {
-		debug::dump_io_set(set);
-	}
-	do_syscall(SYS_exit_group, status);
 #else
 
-	dandelion.exit_code = status;
-
-	__asm__ volatile(
-		"ldr c0, [%0] \n"
-		"ldpbr c29, [c0] \n"
-		: : "r" (&__dandelion_return_address) : "c0"
-	);
 #endif
 	__builtin_unreachable();
 }

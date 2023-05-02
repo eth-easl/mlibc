@@ -1,6 +1,8 @@
 project('mlibc', default_options: ['warning_level=2', 'cpp_std=c++20'], version: '3.0.0')
 
-if host_machine.system() == 'dandelion' and host_machine.cpu_family() == 'aarch64'
+runtime = meson.get_external_property('runtime', 'debug')
+
+if host_machine.system() == 'dandelion' and runtime == 'cheri'
 	add_global_arguments(['-mabi=aapcs', '-march=morello'], language: ['c', 'cpp'])
 endif
 
@@ -314,7 +316,7 @@ if not headers_only
 		elif compiler_rt.found()
 			rtlib_deps += compiler_rt
 		else
-			error('neither libgcc nor ' + compiler_rt_name + ' was found')
+			warning('neither libgcc nor ' + compiler_rt_name + ' was found')
 		endif
 	endif
 

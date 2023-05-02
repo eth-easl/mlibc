@@ -1,0 +1,18 @@
+[constants]
+cheri_output = '/home/gvilums/cheri/output/'
+bin_prefix = cheri_output + '/morello-sdk/bin/aarch64-unknown-freebsd-'
+
+[binaries]
+c = bin_prefix + 'cc'
+cpp = bin_prefix + 'c++'
+ar = bin_prefix + 'ar'
+strip = bin_prefix + 'strip'
+
+[host_machine]
+system = 'dandelion'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+
+[properties]
+runtime = 'cheri'

@@ -1,6 +1,3 @@
-[constants]
-common_flags = ['-march=morello', '-mabi=aapcs']
-
 [binaries]
 c = 'cc'
 cpp = 'c++'
@@ -9,7 +6,9 @@ strip = 'strip'
 
 [host_machine]
 system = 'dandelion'
-cpu_family = 'aarch64'
-cpu = 'aarch64'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
 endian = 'little'
 
+[properties]
+runtime = 'debug'

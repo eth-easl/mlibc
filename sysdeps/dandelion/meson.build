@@ -1,3 +1,4 @@
+
 rtdl_dso_sources += files(
 	host_machine.cpu_family() / 'arch-syscall.cpp',
 	'generic/sysdeps.cpp',
@@ -13,6 +14,7 @@ libc_include_dirs += dandelion_include_dirs
 libc_sources += files(
 	host_machine.cpu_family() / 'signals.S',
 	host_machine.cpu_family() / 'arch-syscall.cpp',
+	'runtime' / runtime / 'runtime.cpp',
 	'generic/entry.cpp',
 	'generic/sysdeps.cpp',
 )
@@ -85,9 +87,13 @@ if not no_headers
 endif
 
 if not headers_only
+	crt_compile = c_compiler.cmd_array()
+	if runtime == 'cheri'
+		crt_compile += ['-mabi=aapcs', '-march=morello']
+	endif
 	crt = custom_target('crt1',
 		build_by_default: true,
-		command: c_compiler.cmd_array() + ['-mabi=aapcs', '-march=morello', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+		command: crt_compile + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
 		input: host_machine.cpu_family() / 'crt-src/crt1.S',
 		output: 'crt1.o',
 		install: true,
@@ -96,7 +102,7 @@ if not headers_only
 
 	crt_pie = custom_target('Scrt1',
 		build_by_default: true,
-		command: c_compiler.cmd_array() + ['-mabi=aapcs', '-march=morello', '-fPIE', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+		command: crt_compile + ['-fPIE', '-c', '-o', '@OUTPUT@', '@INPUT@'],
 		input: host_machine.cpu_family() / 'crt-src/Scrt1.S',
 		output: 'Scrt1.o',
 		install: true,
@@ -105,7 +111,7 @@ if not headers_only
 
 	custom_target('crti',
 		build_by_default: true,
-		command: c_compiler.cmd_array() + ['-mabi=aapcs', '-march=morello', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+		command: crt_compile + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
 		input: host_machine.cpu_family() / 'crt-src/crti.S',
 		output: 'crti.o',
 		install: true,
@@ -114,7 +120,7 @@ if not headers_only
 
 	custom_target('crtn',
 		build_by_default: true,
-		command: c_compiler.cmd_array() + ['-mabi=aapcs', '-march=morello', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+		command: crt_compile + ['-c', '-o', '@OUTPUT@', '@INPUT@'],
 		input: host_machine.cpu_family() / 'crt-src/crtn.S',
 		output: 'crtn.o',
 		install: true,

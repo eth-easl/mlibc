@@ -1,6 +1,6 @@
 [binaries]
-c = 'gcc'
-cpp = 'g++'
+c = 'cc'
+cpp = 'c++'
 ar = 'ar'
 strip = 'strip'
 
@@ -10,3 +10,5 @@ cpu_family = 'x86_64'
 cpu = 'x86_64'
 endian = 'little'
 
+[properties]
+runtime = 'mmu'
