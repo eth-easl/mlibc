@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <bits/ensure.h>
 
 #include <sys/syscall.h>
 #include <cxx-syscall.hpp>
@@ -68,6 +70,23 @@ void dump_global_data() {
 	}
 }
 
+int vm_map(void *hint, size_t size, int prot, int flags,
+		int fd, off_t offset, void **window) {
+	auto ret = do_syscall(SYS_mmap, hint, size, prot, flags, fd, offset);
+	// TODO: musl fixes up EPERM errors from the kernel.
+	if(int e = sc_error(ret); e)
+		return e;
+	*window = sc_ptr_result<void>(ret);
+	return 0;
+}
+
+int vm_unmap(void *pointer, size_t size) {
+	auto ret = do_syscall(SYS_munmap, pointer, size);
+	if(int e = sc_error(ret); e)
+		return e;
+	return 0;
+}
+
 }; // namespace debug
 
 void enter() {
@@ -79,6 +98,10 @@ void enter() {
 	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
 	dandelion.input_root = {nullptr, "", &example_input_file};
 	dandelion.output_root = {&out_set, "", &example_output_file};
+
+	void* heap_offset = nullptr;
+	__ensure(!debug::vm_map(nullptr, 1ull << 32, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &heap_offset));
+	dandelion.heap_offset = (uintptr_t)heap_offset;
 }
 
 [[noreturn]] void exit() {
@@ -86,5 +109,7 @@ void enter() {
 	do_syscall(SYS_exit_group, 0);
     __builtin_unreachable();
 }
+
+
 
 };
