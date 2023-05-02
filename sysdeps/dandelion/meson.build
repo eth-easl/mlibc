@@ -15,7 +15,6 @@ libc_sources += files(
 	host_machine.cpu_family() / 'arch-syscall.cpp',
 	'generic/entry.cpp',
 	'generic/sysdeps.cpp',
-	'generic/dandelion.cpp',
 )
 
 if not disable_posix_option

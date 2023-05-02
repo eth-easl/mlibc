@@ -23,7 +23,6 @@ struct io_set {
 };
 
 struct dandelion {
-	const void * __capability return_pair;
 	int exit_code;
 
 	size_t heap_offset;
@@ -36,7 +35,7 @@ struct dandelion {
 	struct io_set output_root;
 };
 
-extern struct dandelion dandelion;
+extern struct dandelion __dandelion_global_data;
 
 #ifdef __cplusplus
 }; // extern "C"

@@ -36,21 +36,35 @@ extern "C" long __do_syscall_ret(unsigned long ret) {
 }
 #endif
 
+extern "C" {
+
+// required for linking with normal gcc
+char __dso_handle;
+
+// global dandelion data visible to runtime
+struct dandelion __dandelion_global_data;
+
+// convenience alias to avoid polluting global namespace
+#define dandelion __dandelion_global_data
+
+// return address only exists for CHERI
+// TODO find a better macro to check for CHERI
+#ifndef __x86_64__
+const void * __capability __dandelion_return_address;
+#endif
+
+};
+
 namespace mlibc {
 
 namespace debug {
 
 int write(int fd, const void *buffer, size_t size, ssize_t *bytes_written) {
-#if defined(__x86_64__)
 	auto ret = do_cp_syscall(SYS_write, fd, buffer, size);
 	if(int e = sc_error(ret); e)
 		return e;
 	*bytes_written = sc_int_result<ssize_t>(ret);
 	return 0;
-#else
-	*bytes_written = 0;
-	return -1;
-#endif
 }
 
 int write_all(int fd, const void *buffer, size_t size) {
@@ -1688,6 +1702,7 @@ void sys_thread_exit() {
 }
 
 void sys_exit(int status) {
+	// serialize all files to dandelion io structure
 	vfs::get_file_table().finalize();
 
 	// dump stdout file to console
@@ -1707,7 +1722,7 @@ void sys_exit(int status) {
 	__asm__ volatile(
 		"ldr c0, [%0] \n"
 		"ldpbr c29, [c0] \n"
-		: : "r" (&dandelion.return_pair) : "c0"
+		: : "r" (&__dandelion_return_address) : "c0"
 	);
 #endif
 	__builtin_unreachable();

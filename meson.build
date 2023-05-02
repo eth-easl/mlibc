@@ -301,7 +301,8 @@ subdir('options/bsd')
 rtlib_deps = []
 
 if not headers_only
-	if host_machine.cpu_family() == 'aarch64' or host_machine.cpu_family() == 'riscv64'
+    # when building for dandelion we don't link with either libgcc or compiler_rt, and things seem to work (at least for now)
+	if host_machine.system() != 'dandelion' and (host_machine.cpu_family() == 'aarch64' or host_machine.cpu_family() == 'riscv64')
 		# Some architectures require us to link with libgcc or compiler_rt
 		libgcc = meson.get_compiler('c').find_library('gcc', required: false)
 
