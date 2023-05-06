@@ -832,9 +832,4 @@ public:
 	}
 };
 
-inline FileTable& get_file_table() {
-	static frg::eternal<FileTable> list;
-	return *list;
-}
-
 }; // namespace vfs

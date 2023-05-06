@@ -36,6 +36,15 @@ struct dandelion_data __dandelion_global_data;
 
 namespace mlibc {
 
+namespace vfs {
+
+FileTable& get_file_table() {
+	static frg::eternal<FileTable> list;
+	return *list;
+}
+
+};
+
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
 	(void)hint, (void)prot, (void)flags, (void)fd, (void)offset;
