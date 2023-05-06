@@ -7,6 +7,7 @@ if host_machine.system() == 'dandelion' and runtime == 'cheri'
 endif
 
 fs = import('fs')
+cmake = import('cmake')
 
 rtdl_include_dirs = [
 	include_directories('options/internal/include'),
@@ -115,6 +116,12 @@ if host_machine.system() == 'linux'
 	libc_include_dirs += include_directories('sysdeps/linux/include')
 	subdir('sysdeps/linux')
 elif host_machine.system() == 'dandelion'
+
+	dandelion_interface = cmake.subproject('dandelionFunctionInterface')
+	dandelion = dandelion_interface.dependency('dandelion')
+
+	libc_deps += dandelion
+
 	provides_bits_syscall_h = true
 	disable_linux_headers = true
 	rtdl_include_dirs += include_directories('sysdeps/dandelion/include')

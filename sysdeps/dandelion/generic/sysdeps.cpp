@@ -29,9 +29,6 @@ extern "C" {
 // required for linking with normal gcc
 __attribute__((weak)) char __dso_handle;
 
-// global dandelion data visible to runtime
-struct dandelion_data __dandelion_global_data;
-
 };
 
 namespace mlibc {

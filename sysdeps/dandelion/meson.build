@@ -82,8 +82,6 @@ if not no_headers
 		'include/bits/syscall_aliases.h',
 		subdir: 'bits'
 	)
-
-	install_headers('include/dandelion.h')
 endif
 
 if not headers_only
