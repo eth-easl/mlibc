@@ -51,7 +51,11 @@ int sys_vm_map(void *hint, size_t size, int prot, int flags,
 	static uintptr_t alloc_base = 0;
 	size_t aligned_size = ((size - 1) | 4095) + 1;
 	if (alloc_base == 0) {
-		alloc_base = (((uintptr_t)dandelion.heap_offset - 1) | 4095) + 1;
+		alloc_base = (((uintptr_t)dandelion.heap_begin - 1) | 4095) + 1;
+	}
+	if (alloc_base + aligned_size > dandelion.heap_end) {
+		mlibc::infoLogger() << "mlibc: sys_vm_map: out of memory" << frg::endlog;
+		return ENOMEM;
 	}
 	*window = (void*)alloc_base;
 	alloc_base += aligned_size;
@@ -74,9 +78,9 @@ void sys_libc_log(const char *message) {
 }
 
 void sys_libc_panic() {
-	// __builtin_trap();
-	// try exiting abnormally instead of causing trap
-	sys_exit(6); 
+	__builtin_trap();
+	// dandelion.exit_code = 6;
+	// runtime::exit();
 }
 
 int sys_tcb_set(void *pointer) {

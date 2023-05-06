@@ -34,38 +34,38 @@ int write_all(int fd, const void *buffer, size_t size) {
 	return 0;
 }
 
-void dump_io_buf(const char* setid, io_buf* buf) {
+void dump_io_buf(const char* setid, io_buffer* buf) {
 	char tmp[256];
 	size_t setidlen = 0;
 	if (setid) {
 		setidlen = strlen(setid);
 		memcpy(tmp, setid, setidlen);
 	}
-	size_t identlen = 0;
+	size_t identlen = buf->ident_len;
 	if (buf->ident) {
 		tmp[setidlen] = ' ';
-		identlen = strlen(buf->ident);
 		memcpy(tmp + setidlen + 1, buf->ident, identlen);
 		++identlen;
 	}
 	tmp[setidlen + identlen] = ':';
 	tmp[setidlen + identlen + 1] = '\n';
 	write_all(1, tmp, setidlen + identlen + 2);
-	write_all(1, buf->buffer, buf->size);
+	write_all(1, buf->data, buf->data_len);
 	write_all(1, "\n", 1);
 }
 
 void dump_io_set(io_set* set) {
-	for (io_buf* buf = set->buf_head; buf; buf = buf->next) {
+	for (io_buffer* buf = set->buffers; buf != set->buffers + set->buffers_len; ++buf) {
 		dump_io_buf(set->ident, buf);
 	}
 }
 
 void dump_global_data() {
+
 	debug::dump_io_buf("stdout", &dandelion.stdout);
 	debug::dump_io_buf("stderr", &dandelion.stderr);
 
-	for (auto* set = &dandelion.output_root; set != nullptr; set = set->next) {
+	for (auto* set = dandelion.output_sets; set != dandelion.output_sets + dandelion.output_sets_len; ++set) {
 		debug::dump_io_set(set);
 	}
 }
@@ -91,17 +91,32 @@ int vm_unmap(void *pointer, size_t size) {
 
 void enter() {
 	static const char input_file_content[] = "This is an example input file";
-	static io_buf example_input_file{nullptr, "input.txt", (void*)input_file_content, sizeof(input_file_content)};
-	static io_buf example_output_file{nullptr, "root_output.txt", nullptr, 0};
-	static io_set out_set{nullptr, "output", nullptr};
+	static const char input_file_name[] = "input.txt";
+	static const char output_file_name[] = "root_output.txt";
+	static io_buffer example_input_file{input_file_name, sizeof(input_file_name) - 1, (void*)input_file_content, sizeof(input_file_content)};
+	static io_buffer example_output_file{output_file_name, sizeof(output_file_name) - 1, nullptr, 0};
 
-	dandelion.stdin = {nullptr, nullptr, nullptr, 0};
-	dandelion.input_root = {nullptr, "", &example_input_file};
-	dandelion.output_root = {&out_set, "", &example_output_file};
+	static io_set input_sets[] = {
+		{nullptr, 0, &example_input_file, 1},
+	};
+	static io_set output_sets[] = {
+		{nullptr, 0, &example_output_file, 1},
+		{"output", 6, nullptr, 0},
+	};
 
-	void* heap_offset = nullptr;
-	__ensure(!debug::vm_map(nullptr, 1ull << 32, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &heap_offset));
-	dandelion.heap_offset = (uintptr_t)heap_offset;
+	dandelion.stdin = {nullptr, 0, nullptr, 0};
+
+	dandelion.input_sets = input_sets;
+	dandelion.input_sets_len = sizeof(input_sets) / sizeof(input_sets[0]);
+
+	dandelion.output_sets = output_sets;
+	dandelion.output_sets_len = sizeof(output_sets) / sizeof(output_sets[0]);
+
+	size_t alloc_size = 1ull << 32;
+	void* heap_ptr = nullptr;
+	__ensure(!debug::vm_map(nullptr, alloc_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &heap_ptr));
+	dandelion.heap_begin = (uintptr_t)heap_ptr;
+	dandelion.heap_end = dandelion.heap_begin + alloc_size;
 }
 
 [[noreturn]] void exit() {

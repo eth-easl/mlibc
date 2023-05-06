@@ -6,33 +6,39 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <stdint.h>
 
-struct io_buf {
-	struct io_buf* next;
+struct io_buffer {
 	const char* ident;
+	size_t ident_len;
 
-	void* buffer;
-	size_t size;
+	void* data;
+	size_t data_len;
 };
 
 struct io_set {
-	struct io_set* next;
 	const char* ident;
+	size_t ident_len;
 
-	struct io_buf* buf_head;
+	struct io_buffer* buffers;
+	size_t buffers_len;
 };
 
 struct dandelion_data {
 	int exit_code;
 
-	size_t heap_offset;
+	uintptr_t heap_begin;
+	uintptr_t heap_end;
 
-	struct io_buf stdin;
-	struct io_buf stdout;
-	struct io_buf stderr;
+	struct io_buffer stdin;
+	struct io_buffer stdout;
+	struct io_buffer stderr;
 
-	struct io_set input_root;
-	struct io_set output_root;
+	struct io_set* input_sets;
+	size_t input_sets_len;
+
+	struct io_set* output_sets;
+	size_t output_sets_len;
 };
 
 extern struct dandelion_data __dandelion_global_data;
