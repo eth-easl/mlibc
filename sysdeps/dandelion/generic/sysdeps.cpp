@@ -81,10 +81,12 @@ void sys_libc_panic() {
 }
 
 int sys_tcb_set(void *pointer) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) && defined(__linux__)
 	auto ret = do_syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, pointer);
 	if(int e = sc_error(ret); e)
 		return e;
+#elif defined(__x86_64__) && defined(__FreeBSD__)
+	do_syscall(165, 129, pointer);
 #elif defined(__riscv)
 	uintptr_t thread_data = reinterpret_cast<uintptr_t>(pointer) + sizeof(Tcb);
 	asm volatile ("mv tp, %0" :: "r"(thread_data));
