@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <bits/ensure.h>
 #include <mlibc/elf/startup.h>
-#include <runtime.hpp>
+#include <dandelion/runtime.h>
 
 // defined by the POSIX library
 void __mlibc_initLocale();
@@ -29,7 +29,7 @@ LibraryGuard::LibraryGuard() {
 }
 
 extern "C" void __mlibc_entry(uintptr_t *entry_stack, int (*main_fn)(int argc, char *argv[], char *env[])) {
-	mlibc::runtime::enter();
+	dandelion_init();
 	__dlapi_enter(entry_stack);
 	auto result = main_fn(__mlibc_stack_data.argc, __mlibc_stack_data.argv, environ);
 	exit(result);

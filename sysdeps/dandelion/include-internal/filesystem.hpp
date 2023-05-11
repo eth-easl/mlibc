@@ -13,8 +13,7 @@
 #include <dirent.h>
 
 #include <refcounted.hpp>
-#include <dandelion.h>
-#include <runtime.hpp>
+#include <dandelion/runtime.h>
 
 namespace mlibc::vfs {
 
@@ -533,8 +532,8 @@ class FileTable {
 		return base;
 	}
 
-	int create_file_from_buf(const io_set* set, io_buffer* buf) {
-		auto basepath = string{set->ident, set->ident_len, getAllocator()};
+	int create_file_from_buf(size_t set_idx, io_buffer* buf) {
+		auto basepath = string{dandelion_input_set_ident(set_idx), dandelion_input_set_ident_len(set_idx), getAllocator()};
 		basepath += string{buf->ident, buf->ident_len, getAllocator()};
 		auto pathinfo = path_split(basepath);
 		PathComponents components{pathinfo.dir};
@@ -568,7 +567,7 @@ class FileTable {
 		return entries;
 	}
 
-	void create_bufs_from_dir(io_set* set, Rc<Directory> dir, frg::string_view path) {
+	void create_bufs_from_dir(size_t setidx, Rc<Directory> dir, frg::string_view path) {
 		dir->for_each([&](const string& name, Rc<File>& file) {
 			size_t ident_len_with_null = path.size() + name.size() + 2;
 
@@ -578,13 +577,18 @@ class FileTable {
 			memcpy(buf_ident + path.size() + 1, name.data(), name.size());
 			buf_ident[path.size() + name.size() + 1] = '\0';
 
-			::new (&set->buffers[set->buffers_len]) io_buffer{buf_ident, ident_len_with_null - 1, file->buffer(), file->size()};
-			++set->buffers_len;
+			struct io_buffer buf {
+				buf_ident,
+				ident_len_with_null - 1,
+				file->buffer(),
+				file->size()
+			};
+			dandelion_add_output(setidx, buf);
 		}, [&](const string& name, Rc<Directory>& subdir) {
 			string new_path{path, getAllocator()};
 			new_path += '/';
 			new_path += name;
-			create_bufs_from_dir(set, subdir, new_path);
+			create_bufs_from_dir(setidx, subdir, new_path);
 		});
 	}
 
@@ -594,19 +598,20 @@ public:
 		this->fs_root->set_parent(this->fs_root);
 		this->working_dir = this->fs_root;
 
-		for (size_t i = 0; i < dandelion.input_sets_len; ++i) {
-			size_t num_bufs = dandelion.input_sets[i].buffers_len;
+		size_t num_input_sets = dandelion_input_set_count();
+		for (size_t i = 0; i < num_input_sets; ++i) {
+			size_t num_bufs = dandelion_input_buffer_count(i);;
 			for (size_t j = 0; j < num_bufs; ++j) {
-				auto* set = &dandelion.input_sets[i];
-				auto* buf = &dandelion.input_sets[i].buffers[j];
+				auto* buf = dandelion_get_input(i, j);
 
-				create_file_from_buf(set, buf);
+				create_file_from_buf(i, buf);
 			}
 		}
 
+		// TODO actually open a file for reading from stdin, not just empty
 		this->create_entry_at(0,
 			FileTableEntry::OpenFile {
-				Rc<File>::make(&dandelion.stdin),
+				Rc<File>::make(),
 				0,
 				O_RDONLY
 		});
@@ -627,42 +632,47 @@ public:
 	}
 
 	void finalize() {
-		size_t num_root_bufs = dandelion.output_sets[0].buffers_len;
-		for (size_t i = 0; i < num_root_bufs; ++i) {
-			auto* buf = &dandelion.output_sets[0].buffers[i];
-			auto path = frg::string_view{buf->ident, buf->ident_len};
-			auto entry = Directory::find(this->fs_root, path);
-			if (entry.is<Rc<File>>()) {
-				auto& file = entry.get<Rc<File>>();
-				buf->data = file->buffer();
-				buf->data_len = file->size();
-			}
-		}
+		// size_t num_root_bufs = dandelion.output_sets[0].buffers_len;
+		// for (size_t i = 0; i < num_root_bufs; ++i) {
+		// 	auto* buf = &dandelion.output_sets[0].buffers[i];
+		// 	auto path = frg::string_view{buf->ident, buf->ident_len};
+		// 	auto entry = Directory::find(this->fs_root, path);
+		// 	if (entry.is<Rc<File>>()) {
+		// 		auto& file = entry.get<Rc<File>>();
+		// 		buf->data = file->buffer();
+		// 		buf->data_len = file->size();
+		// 	}
+		// }
 
-		for (size_t i = 1; i < dandelion.output_sets_len; ++i) {
-			auto* set = &dandelion.output_sets[i];
-			auto set_path = frg::string_view{set->ident, set->ident_len};
+		size_t num_out_sets = dandelion_output_set_count();
+		// we skip the root set
+		for (size_t i = 1; i < num_out_sets; ++i) {
+			auto set_path = frg::string_view{dandelion_output_set_ident(i), dandelion_output_set_ident_len(i)};
 			auto entry = Directory::find(this->fs_root, set_path);
 			if (entry.is<Rc<Directory>>()) {
 				auto dir_entry = entry.get<Rc<Directory>>();
-
-				size_t buf_count = recursive_get_num_entries(dir_entry);
-				set->buffers = (io_buffer*)getAllocator().allocate(buf_count * sizeof(io_buffer));
-				set->buffers_len = 0;
-
-				create_bufs_from_dir(set, std::move(dir_entry), "");
-
-				__ensure(set->buffers_len == buf_count);
+				// size_t buf_count = recursive_get_num_entries(dir_entry);
+				create_bufs_from_dir(i, std::move(dir_entry), "");
 			}
 		}
 
 		auto stdout_file = this->get(1)->get_file();
-		dandelion.stdout.data = stdout_file->buffer();
-		dandelion.stdout.data_len = stdout_file->size();
+		io_buffer stdout_buf{
+			"stdout",
+			6,
+			stdout_file->buffer(),
+			stdout_file->size(),
+		};
+		dandelion_add_output(0, stdout_buf);
 
 		auto stderr_file = this->get(2)->get_file();
-		dandelion.stderr.data = stderr_file->buffer();
-		dandelion.stderr.data_len = stderr_file->size();
+		io_buffer stderr_buf{
+			"stderr",
+			6,
+			stderr_file->buffer(),
+			stderr_file->size(),
+		};
+		dandelion_add_output(0, stderr_buf);
 	}
 
 	FileTable(const FileTable&) = delete;

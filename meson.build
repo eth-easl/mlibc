@@ -118,9 +118,10 @@ if host_machine.system() == 'linux'
 elif host_machine.system() == 'dandelion'
 
 	dandelion_interface = cmake.subproject('dandelionFunctionInterface')
-	dandelion = dandelion_interface.dependency('dandelion')
-
-	libc_deps += dandelion
+	dandelion_rt = dandelion_interface.dependency('dandelion_runtime')
+	dandelion_sys = dandelion_interface.dependency('dandelion_system')
+	libc_deps += dandelion_rt
+	libc_deps += dandelion_sys
 
 	provides_bits_syscall_h = true
 	disable_linux_headers = true

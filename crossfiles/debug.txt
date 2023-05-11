@@ -12,3 +12,9 @@ endian = 'little'
 
 [properties]
 runtime = 'debug'
+
+[built-in options]
+default_library = 'static'
+
+[cmake]
+DANDELION_PLATFORM = 'debug'

@@ -5,13 +5,13 @@
 #include <mlibc/all-sysdeps.hpp>
 #include <sys/syscall.h>
 #include "cxx-syscall.hpp"
+#include "mlibc/arch-defs.hpp"
 #include "mlibc/posix-sysdeps.hpp"
 
 #include "abi-bits/errno.h"
 #include "abi-bits/fcntl.h"
 
-#include <dandelion.h>
-#include <runtime.hpp>
+#include <dandelion/runtime.h>
 #include <filesystem.hpp>
 
 #ifndef MLIBC_BUILDING_RTDL
@@ -45,17 +45,12 @@ FileTable& get_file_table() {
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
 		int fd, off_t offset, void **window) {
 	(void)hint, (void)prot, (void)flags, (void)fd, (void)offset;
-	static uintptr_t alloc_base = 0;
-	size_t aligned_size = ((size - 1) | 4095) + 1;
-	if (alloc_base == 0) {
-		alloc_base = (((uintptr_t)dandelion.heap_begin - 1) | 4095) + 1;
-	}
-	if (alloc_base + aligned_size > dandelion.heap_end) {
+	void* res = dandelion_alloc(size, page_size);
+	if (res == NULL) {
 		mlibc::infoLogger() << "mlibc: sys_vm_map: out of memory" << frg::endlog;
 		return ENOMEM;
 	}
-	*window = (void*)alloc_base;
-	alloc_base += aligned_size;
+	*window = res;
 	return 0;
 }
 
@@ -81,18 +76,19 @@ void sys_libc_panic() {
 }
 
 int sys_tcb_set(void *pointer) {
-#if defined(__x86_64__) && defined(__linux__)
-	auto ret = do_syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, pointer);
-	if(int e = sc_error(ret); e)
-		return e;
-#elif defined(__x86_64__) && defined(__FreeBSD__)
-	do_syscall(165, 129, pointer);
+#if defined(__x86_64__)
+	dandelion_set_thread_pointer(pointer);
+	// auto ret = do_syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, pointer);
+	// if(int e = sc_error(ret); e)
+	// 	return e;
 #elif defined(__riscv)
 	uintptr_t thread_data = reinterpret_cast<uintptr_t>(pointer) + sizeof(Tcb);
-	asm volatile ("mv tp, %0" :: "r"(thread_data));
+	dandelion_set_thread_pointer((void*)thread_data);
+	// asm volatile ("mv tp, %0" :: "r"(thread_data));
 #elif defined (__aarch64__)
 	uintptr_t thread_data = reinterpret_cast<uintptr_t>(pointer) + sizeof(Tcb) - 0x10;
-	asm volatile ("msr tpidr_el0, %0" :: "r"(thread_data));
+	dandelion_set_thread_pointer((void*)thread_data);
+	// asm volatile ("msr tpidr_el0, %0" :: "r"(thread_data));
 #else
 #error "Missing architecture specific code."
 #endif
@@ -796,11 +792,11 @@ void sys_thread_exit() {
 }
 
 void sys_exit(int status) {
-	dandelion.exit_code = status;
 	// serialize all files to dandelion io structure
 	vfs::get_file_table().finalize();
 
-	runtime::exit();
+	dandelion_exit(status);
+	__builtin_unreachable();
 }
 
 #endif // MLIBC_BUILDING_RTDL

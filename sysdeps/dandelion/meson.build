@@ -14,7 +14,6 @@ libc_include_dirs += dandelion_include_dirs
 libc_sources += files(
 	host_machine.cpu_family() / 'signals.S',
 	host_machine.cpu_family() / 'arch-syscall.cpp',
-	'runtime' / runtime / 'runtime.cpp',
 	'generic/entry.cpp',
 	'generic/sysdeps.cpp',
 )

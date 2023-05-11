@@ -16,3 +16,9 @@ endian = 'little'
 
 [properties]
 runtime = 'cheri'
+
+[built-in options]
+default_library = 'static'
+
+[cmake]
+DANDELION_PLATFORM = 'cheri'

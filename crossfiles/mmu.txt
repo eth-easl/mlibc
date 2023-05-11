@@ -11,4 +11,10 @@ cpu = 'x86_64'
 endian = 'little'
 
 [properties]
-runtime = 'mmu'
+runtime = 'mmu_freebsd'
+
+[built-in options]
+default_library = 'static'
+
+[cmake]
+DANDELION_PLATFORM = 'mmu_freebsd'
