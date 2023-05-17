@@ -1,0 +1,20 @@
+[binaries]
+c = 'cc'
+cpp = 'c++'
+ar = 'ar'
+strip = 'strip'
+
+[host_machine]
+system = 'dandelion'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[properties]
+runtime = 'mmu_linux'
+
+[built-in options]
+default_library = 'static'
+
+[cmake]
+DANDELION_PLATFORM = 'mmu_linux'

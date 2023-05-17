@@ -225,7 +225,8 @@ public:
 		}
 	}
 
-	static int remove_dir(Rc<Directory> self, frg::string_view name) {
+	static int remove_dir(Rc<Directory> self, frg::string_view namesv) {
+		string name{namesv, getAllocator()};
 		auto dir = self->dirs.get(name);
 		if (dir != nullptr) {
 			if ((*dir)->is_empty()) {
@@ -269,7 +270,8 @@ public:
 			while (i < path.size() && path[i] != '/') {
 				++i;
 			}
-			auto sub_path = path.sub_string(begin, i - begin);
+			auto sub_path_sv = path.sub_string(begin, i - begin);
+			string sub_path{sub_path_sv, getAllocator()};
 			// can only be file if name goes to the very end
 			if (i == path.size()) {
 				Rc<File>* file = base->files.get(sub_path);
