@@ -1,4 +1,5 @@
 [wrap-git]
 directory = dandelionFunctionInterface
-url = https://github.com/eth-easl/dandelionFunctionInterface.git
-revision = 00f280dcf7b8e5dc313b4df0c9580097ce57295a
+url = git@github.com:eth-easl/dandelionFunctionInterface.git
+revision = 23e250756d2bf0ad73256dedb2abbdbdf06bab83
+
