@@ -3,8 +3,8 @@
 _start:
 	mov x0, sp
 	adr x1, main
-
-	bl __mlibc_entry
+	adr x2, __mlibc_entry
+	blr x2
 	brk #0
 
 .section .note.GNU-stack,"",%progbits
