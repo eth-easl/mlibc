@@ -3,6 +3,7 @@
 _start:
 	mov %rsp, %rdi
 	lea main(%rip), %rsi
-	call __mlibc_entry
+	lea __mlibc_entry(%rip), %rax
+	call *%rax
 .section .note.GNU-stack,"",%progbits
 

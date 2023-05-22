@@ -36,11 +36,6 @@ void writeMatrixToFile(const char* filename, double* matrix, int size) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Please provide the size of the matrices as a command-line argument.\n");
-        return 1;
-    }
-
     int size = 128;
 
     // Allocate memory for matrices A, B, and C
