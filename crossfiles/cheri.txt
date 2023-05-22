@@ -5,6 +5,7 @@ bin_prefix = cheri_output + '/morello-sdk/bin/aarch64-unknown-freebsd-'
 [binaries]
 c = bin_prefix + 'cc'
 cpp = bin_prefix + 'c++'
+ld = bin_prefix + 'ld'
 ar = bin_prefix + 'ar'
 strip = bin_prefix + 'strip'
 
@@ -22,3 +23,4 @@ default_library = 'static'
 
 [cmake]
 DANDELION_PLATFORM = 'cheri'
+
