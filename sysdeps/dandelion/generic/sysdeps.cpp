@@ -3,8 +3,6 @@
 #include <abi-bits/fcntl.h>
 #include <mlibc/debug.hpp>
 #include <mlibc/all-sysdeps.hpp>
-#include <sys/syscall.h>
-#include "cxx-syscall.hpp"
 #include "mlibc/arch-defs.hpp"
 #include "mlibc/posix-sysdeps.hpp"
 
@@ -181,7 +179,6 @@ int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2
 #ifndef MLIBC_BUILDING_RTDL
 
 int sys_clock_get(int clock, time_t *secs, long *nanos) {
-	// TODO get initial time from auxv
 	(void)clock;
 	*secs = 0;
 	*nanos = 0;
@@ -994,10 +991,9 @@ int sys_fdatasync(int fd) {
 }
 
 int sys_getrandom(void *buffer, size_t length, int flags, ssize_t *bytes_written) {
-	auto ret = do_syscall(SYS_getrandom, buffer, length, flags);
-	if (int e = sc_error(ret); e)
-		return e;
-	*bytes_written = sc_int_result<ssize_t>(ret);
+	(void)flags;
+	memset(buffer, 0, length);
+	*bytes_written = length;
 	return 0;
 }
 
