@@ -46,3 +46,16 @@ This will create a `build` directory. Then, `cd build` and run the tests (showin
 ```
 meson test -v
 ```
+
+## Building (Dandelion)
+To set up the build folder to target dandelion, use the following command
+```
+meson setup --cross-file crossfiles/<platform>.txt -Dprefix=<prefix> build
+```
+where `<platform>` is replaced by the name of the target dandelion platform, and `<prefix>` is replaced by the target installation prefix. The set of supported platforms is given by the available files in the `crossfiles` directory. An example invocation:
+```
+meson setup --cross-file crossfiles/mmu_linux.txt -Dprefix=/home/ubuntu/.mlibc build
+```
+Then, `cd` into the `build` directory that was just created, and run `ninja`, followed by `meson install`. The library will be installed at the target prefix.
+
+To compile an application to use the library, `mlibc-gcc`, contained in the `bin` directory at the install prefix, can be used. This will correctly set all flags to compile with mlibc using gcc. For other compilers, the flags must be set manually. The flags used by `mlibc-gcc` can be found in `lib/mlibc-gcc.specs`, also in the install directory.
