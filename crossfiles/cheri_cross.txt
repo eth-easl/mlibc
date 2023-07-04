@@ -1,11 +1,11 @@
 [constants]
-cheri_output = '/home/gvilums/cheri/output/'
+cheri_output = '/home/kuchlert/cheri/output'
 bin_prefix = cheri_output + '/morello-sdk/bin/aarch64-unknown-freebsd-'
 
 [binaries]
-c = bin_prefix + 'cc'
-cpp = bin_prefix + 'c++'
-ld = bin_prefix + 'ld'
+c = bin_prefix + 'clang'
+cpp = bin_prefix + 'clang++'
+ld = bin_prefix + 'ld.ldd'
 ar = bin_prefix + 'ar'
 strip = bin_prefix + 'strip'
 

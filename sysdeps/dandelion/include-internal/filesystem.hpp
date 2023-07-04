@@ -243,42 +243,44 @@ public:
 		return ENOENT;
 	}
 
-	static frg::variant<NoEntry, Rc<File>, Rc<Directory>> find(Rc<Directory> base, frg::string_view path) {
-		for (size_t i = 0;;) {
-			// skip slashes
-			while (i < path.size() && path[i] == '/') {
-				++i;
-			}
-			// ends with a slash, so is a directory
-			if (i == path.size()) {
-				return base;
-			}
-			// check if special dir
-			if (path[i] == '.') {
-				if (i + 2 < path.size() && path[i + 1] == '.' && path[i + 2] == '/') {
-					base = base->parent;
-					i += 2;
-					continue;
-				}
-				if (i + 1 < path.size() && path[i + 1] == '/') {
-					++i;
-					continue;
-				}
-			}
-			// find 
-			size_t begin = i;
-			while (i < path.size() && path[i] != '/') {
-				++i;
-			}
-			auto sub_path_sv = path.sub_string(begin, i - begin);
-			string sub_path{sub_path_sv, getAllocator()};
-			// can only be file if name goes to the very end
-			if (i == path.size()) {
-				Rc<File>* file = base->files.get(sub_path);
-				if (file != nullptr) {
-					return *file;
-				}
-			}
+  static frg::variant<NoEntry, Rc<File>, Rc<Directory>> find(
+      Rc<Directory> base, frg::string_view path) {
+    if(path.size() == 0) return NoEntry{};
+	for (size_t i = 0;; ) {
+      // skip slashes
+      while (i < path.size() && path[i] == '/') {
+        ++i;
+      }
+      // ends with a slash, so is a directory
+      if (i == path.size()) {
+        return base;
+      }
+      // check if special dir
+      if (path[i] == '.') {
+        if (i + 2 < path.size() && path[i + 1] == '.' && path[i + 2] == '/') {
+          base = base->parent;
+          i += 2;
+          continue;
+        }
+        if (i + 1 < path.size() && path[i + 1] == '/') {
+          ++i;
+          continue;
+        }
+      }
+      // find
+      size_t begin = i;
+      while (i < path.size() && path[i] != '/') {
+        ++i;
+      }
+      auto sub_path_sv = path.sub_string(begin, i - begin);
+      string sub_path{sub_path_sv, getAllocator()};
+      // can only be file if name goes to the very end
+      if (i == path.size()) {
+        Rc<File>* file = base->files.get(sub_path);
+        if (file != nullptr) {
+          return *file;
+        }
+      }
 
 			Rc<Directory>* dir = base->dirs.get(sub_path);
 			if (dir != nullptr) {
@@ -287,7 +289,6 @@ public:
 				return NoEntry{};
 			}
 		}
-		// should be unreachable
 		return NoEntry{};
 	}
 
@@ -534,104 +535,149 @@ class FileTable {
 		return base;
 	}
 
-	int create_file_from_buf(size_t set_idx, io_buffer* buf) {
-		auto basepath = string{dandelion_input_set_ident(set_idx), dandelion_input_set_ident_len(set_idx), getAllocator()};
-		basepath += string{buf->ident, buf->ident_len, getAllocator()};
-		auto pathinfo = path_split(basepath);
-		PathComponents components{pathinfo.dir};
+  frg::variant<NoEntry, Rc<Directory>> create_dirs_from_string(frg::string_view dir_path) {
+    PathComponents components{dir_path};
 
-		auto current = this->fs_root;
-		for (auto component = components.next(); component.size() > 0; component = components.next()) {
-			auto next = Directory::find(current, component);
-			if (next.is<Rc<Directory>>()) {
-				current = next.get<Rc<Directory>>();
-			} else if (next.is<NoEntry>()) {
-				current = Directory::create_dir(current, component);
-			} else {
-				return 1;
-			}
-		}
+    auto current = this->fs_root;
+    for (auto component = components.next(); component.size() > 0;
+         component = components.next()) {
+      auto next = Directory::find(current, component);
+      if (next.is<Rc<Directory>>()) {
+        current = next.get<Rc<Directory>>();
+      } else if (next.is<NoEntry>()) {
+        current = Directory::create_dir(current, component);
+      } else {
+        return NoEntry{};
+      }
+    }
+   return current; 
+  }
 
-		auto file = Rc<File>::make(buf);
-		Directory::link_file(current, pathinfo.base, file);
-		return 0;
-	}
+  int create_file_from_buf(size_t set_idx, io_buffer* buf) {
+    auto basepath =
+        string{dandelion_input_set_ident(set_idx),
+               dandelion_input_set_ident_len(set_idx), getAllocator()};
+    basepath += "/";
+    basepath += string{buf->ident, buf->ident_len, getAllocator()};
+    auto pathinfo = path_split(basepath);
+    PathComponents components{pathinfo.dir};
 
-	size_t recursive_get_num_entries(Rc<Directory> dir) {
-		size_t entries = 0;
-		dir->for_each([&](const string& name, Rc<File>& file) {
-			(void)name, (void)file;
-			++entries;
-		}, [&](const string& name, Rc<Directory>& subdir) {
-			(void)name;
-			entries += recursive_get_num_entries(subdir);
-		});
-		return entries;
-	}
+    auto dir = create_dirs_from_string(pathinfo.dir);
+    if (dir.is<NoEntry>()) return 1;
+    auto current_dir = dir.get<Rc<Directory>>();
 
-	void create_bufs_from_dir(size_t setidx, Rc<Directory> dir, frg::string_view path) {
-		dir->for_each([&](const string& name, Rc<File>& file) {
-			size_t ident_len_with_null = path.size() + name.size() + 2;
+    auto file = Rc<File>::make(buf);
+    Directory::link_file(current_dir, pathinfo.base, file);
+    return 0;
+  }
 
-			char* buf_ident = (char*)getAllocator().allocate(ident_len_with_null);
-			memcpy(buf_ident, path.data(), path.size());
-			buf_ident[path.size()] = '/';
-			memcpy(buf_ident + path.size() + 1, name.data(), name.size());
-			buf_ident[path.size() + name.size() + 1] = '\0';
+  size_t recursive_get_num_entries(Rc<Directory> dir) {
+    size_t entries = 0;
+    dir->for_each(
+        [&](const string& name, Rc<File>& file) {
+          (void)name, (void)file;
+          ++entries;
+        },
+        [&](const string& name, Rc<Directory>& subdir) {
+          (void)name;
+          entries += recursive_get_num_entries(subdir);
+        });
+    return entries;
+  }
 
-			struct io_buffer buf {
-				buf_ident,
-				ident_len_with_null - 1,
-				file->buffer(),
-				file->size()
-			};
-			dandelion_add_output(setidx, buf);
-		}, [&](const string& name, Rc<Directory>& subdir) {
-			string new_path{path, getAllocator()};
-			new_path += '/';
-			new_path += name;
-			create_bufs_from_dir(setidx, subdir, new_path);
-		});
-	}
+  void create_bufs_from_dir(size_t setidx, Rc<Directory> dir,
+                            frg::string_view path) {
+    dir->for_each(
+        [&](const string& name, Rc<File>& file) {
+          char* buf_ident = NULL;
+          char* name_offset = 0;
+          size_t ident_len_with_null = 0;
+          if (path.size() > 0) {
+            ident_len_with_null = path.size() + name.size() + 1;
+            buf_ident = (char*)getAllocator().allocate(ident_len_with_null);
+            memcpy(buf_ident, path.data(), path.size());
+            name_offset = buf_ident + path.size();
+          } else {
+            ident_len_with_null = name.size() + 1;
+            buf_ident = (char*)getAllocator().allocate(ident_len_with_null);
+            name_offset = buf_ident;
+          }
 
-public:
-	FileTable() {
-		this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
-		this->fs_root->set_parent(this->fs_root);
-		this->working_dir = this->fs_root;
+          memcpy(name_offset, name.data(), name.size());
+          buf_ident[path.size() + name.size() + 1] = '\0';
 
-		size_t num_input_sets = dandelion_input_set_count();
-		for (size_t i = 0; i < num_input_sets; ++i) {
-			size_t num_bufs = dandelion_input_buffer_count(i);;
-			for (size_t j = 0; j < num_bufs; ++j) {
-				auto* buf = dandelion_get_input(i, j);
+          struct io_buffer buf {
+            buf_ident, ident_len_with_null - 1, file->buffer(), file->size()
+          };
+          dandelion_add_output(setidx, buf);
+        },
+        [&](const string& name, Rc<Directory>& subdir) {
+          string new_path{path, getAllocator()};
+          new_path += name;
+          new_path += '/';
+          create_bufs_from_dir(setidx, subdir, new_path);
+        });
+  }
 
-				create_file_from_buf(i, buf);
-			}
-		}
+ public:
+  FileTable() {
+    this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
+    this->fs_root->set_parent(this->fs_root);
+    this->working_dir = this->fs_root;
+  
+    // add input sets and files
+    size_t num_input_sets = dandelion_input_set_count();
+    for (size_t i = 0; i < num_input_sets; ++i) {
+      size_t num_bufs = dandelion_input_buffer_count(i);
+      ;
+      for (size_t j = 0; j < num_bufs; ++j) {
+        auto* buf = dandelion_get_input(i, j);
 
-		// TODO actually open a file for reading from stdin, not just empty
-		this->create_entry_at(0,
-			FileTableEntry::OpenFile {
-				Rc<File>::make(),
-				0,
-				O_RDONLY
-		});
+        create_file_from_buf(i, buf);
+      }
+    }
+    // add output sets as directories
+    size_t num_ouput_sets = dandelion_output_set_count();
+    for (size_t i = 0; i < num_ouput_sets; i++){
+      auto dirpath = string{dandelion_output_set_ident(i), dandelion_output_set_ident_len(i), getAllocator()};
+      create_dirs_from_string(dirpath);
+    }
 
-		this->create_entry_at(1,
-			FileTableEntry::OpenFile {
-				Rc<File>::make(),
-				0,
-				O_WRONLY
-		});
+    // check if there is a stdio dir
+    auto stdio = Directory::find(this->fs_root, "stdio");
+    if(stdio.is<Rc<Directory>>()){
+      auto stdio_dir = stdio.get<Rc<Directory>>();
 
-		this->create_entry_at(2,
-			FileTableEntry::OpenFile {
-				Rc<File>::make(),
-				0,
-				O_WRONLY
-		});
-	}
+      auto stdin = Directory::find(stdio_dir, "stdin");
+      if(stdin.is<Rc<File>>()){
+        auto stdin_file = stdin.get<Rc<File>>();
+        this->create_entry_at(
+          0, FileTableEntry::OpenFile{stdin_file, 0, O_RDONLY});
+        Directory::remove_file(stdio_dir, "stdin");
+      } else {
+        this->create_entry_at(
+          0, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_RDONLY});
+      }
+     
+      auto out_file = Rc<File>::make();
+      Directory::link_file(stdio_dir, "stdout", out_file);
+      this->create_entry_at(
+        1, FileTableEntry::OpenFile{out_file, 0, O_WRONLY});
+
+      auto err_file = Rc<File>::make();
+      Directory::link_file(stdio_dir, "stderr", err_file);
+      this->create_entry_at(
+        2, FileTableEntry::OpenFile{err_file, 0, O_WRONLY});
+    } else {
+      this->create_entry_at(
+        0, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_RDONLY});
+      this->create_entry_at(
+        1, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
+      this->create_entry_at(
+        2, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
+
+    }
+}
 
 	void finalize() {
 		// size_t num_root_bufs = dandelion.output_sets[0].buffers_len;
@@ -646,36 +692,19 @@ public:
 		// 	}
 		// }
 
-		size_t num_out_sets = dandelion_output_set_count();
-		// we skip the root set
-		for (size_t i = 1; i < num_out_sets; ++i) {
-			auto set_path = frg::string_view{dandelion_output_set_ident(i), dandelion_output_set_ident_len(i)};
-			auto entry = Directory::find(this->fs_root, set_path);
-			if (entry.is<Rc<Directory>>()) {
-				auto dir_entry = entry.get<Rc<Directory>>();
-				// size_t buf_count = recursive_get_num_entries(dir_entry);
-				create_bufs_from_dir(i, std::move(dir_entry), "");
-			}
-		}
-
-		auto stdout_file = this->get(1)->get_file();
-		io_buffer stdout_buf{
-			"stdout",
-			6,
-			stdout_file->buffer(),
-			stdout_file->size(),
-		};
-		dandelion_add_output(0, stdout_buf);
-
-		auto stderr_file = this->get(2)->get_file();
-		io_buffer stderr_buf{
-			"stderr",
-			6,
-			stderr_file->buffer(),
-			stderr_file->size(),
-		};
-		dandelion_add_output(0, stderr_buf);
-	}
+    size_t num_out_sets = dandelion_output_set_count();
+    // we skip the root set
+    for (size_t i = 0; i < num_out_sets; ++i) {
+      auto set_path = frg::string_view{dandelion_output_set_ident(i),
+                                       dandelion_output_set_ident_len(i)};
+      auto entry = Directory::find(this->fs_root, set_path);
+      if (entry.is<Rc<Directory>>()) {
+        auto dir_entry = entry.get<Rc<Directory>>();
+        // size_t buf_count = recursive_get_num_entries(dir_entry);
+        create_bufs_from_dir(i, std::move(dir_entry), "");
+      }
+    }
+  }
 
 	FileTable(const FileTable&) = delete;
 	FileTable(FileTable&&) = delete;

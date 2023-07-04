@@ -68,9 +68,8 @@ void sys_libc_log(const char *message) {
 }
 
 void sys_libc_panic() {
-	__builtin_trap();
-	// dandelion.exit_code = 6;
-	// runtime::exit();
+  dandelion_exit(INT_MIN);
+  __builtin_unreachable();
 }
 
 int sys_tcb_set(void *pointer) {
@@ -319,8 +318,8 @@ int sys_pipe(int *fds, int flags) {
 }
 
 int sys_fork(pid_t *child) {
-	(void)child;
-	return ENOSYS;
+  (void)child;
+  return ENOSYS;
 }
 
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru, pid_t *ret_pid) {
