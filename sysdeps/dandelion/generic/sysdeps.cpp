@@ -3,6 +3,8 @@
 #include <abi-bits/fcntl.h>
 #include <mlibc/debug.hpp>
 #include <mlibc/all-sysdeps.hpp>
+#include <sys/syscall.h>
+#include "cxx-syscall.hpp"
 #include "mlibc/arch-defs.hpp"
 #include "mlibc/posix-sysdeps.hpp"
 
@@ -74,18 +76,15 @@ void sys_libc_panic() {
 
 int sys_tcb_set(void *pointer) {
 #if defined(__x86_64__)
-	dandelion_set_thread_pointer(pointer);
-	// auto ret = do_syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, pointer);
-	// if(int e = sc_error(ret); e)
-	// 	return e;
+	auto ret = do_syscall(SYS_arch_prctl, 0x1002 /* ARCH_SET_FS */, pointer);
+	if(int e = sc_error(ret); e)
+		return e;
 #elif defined(__riscv)
 	uintptr_t thread_data = reinterpret_cast<uintptr_t>(pointer) + sizeof(Tcb);
-	dandelion_set_thread_pointer((void*)thread_data);
-	// asm volatile ("mv tp, %0" :: "r"(thread_data));
+	asm volatile ("mv tp, %0" :: "r"(thread_data));
 #elif defined (__aarch64__)
 	uintptr_t thread_data = reinterpret_cast<uintptr_t>(pointer) + sizeof(Tcb) - 0x10;
-	dandelion_set_thread_pointer((void*)thread_data);
-	// asm volatile ("msr tpidr_el0, %0" :: "r"(thread_data));
+	asm volatile ("msr tpidr_el0, %0" :: "r"(thread_data));
 #else
 #error "Missing architecture specific code."
 #endif
