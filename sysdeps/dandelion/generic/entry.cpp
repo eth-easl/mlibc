@@ -68,7 +68,7 @@ char **setup_charpparray(struct io_buffer *buffer, int *count) {
         string_count++;
       }
     }
-    *count = string_count - 1;
+    *count = string_count;
     return pointer_buffer;
   } else {
     *count = 0;

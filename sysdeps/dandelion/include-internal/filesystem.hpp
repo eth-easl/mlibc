@@ -1,6 +1,7 @@
 #pragma once
 
 #include <abi-bits/fcntl.h>
+#include <abi-bits/stat.h>
 #include <dandelion/runtime.h>
 #include <dirent.h>
 
@@ -207,6 +208,16 @@ class Directory {
     return 0;
   }
 
+  static int link(Rc<Directory> self, frg::string_view name,
+                  frg::variant<NoEntry, Rc<File>, Rc<Directory>> new_entry) {
+    if (new_entry.is<Rc<Directory>>()) {
+      return Directory::link_dir(self, name, new_entry.get<Rc<Directory>>());
+    } else {
+      return Directory::link_file(self, name, new_entry.get<Rc<File>>());
+    }
+    return ENOENT;
+  }
+
   static Rc<File> create_file(Rc<Directory> self, frg::string_view name) {
     auto file = Rc<File>::make();
     self->files.insert(string{name, getAllocator()}, file);
@@ -242,6 +253,16 @@ class Directory {
     auto file = self->files.get(name);
     if (file) {
       return ENOTDIR;
+    }
+    return ENOENT;
+  }
+
+  static int remove(Rc<Directory> self, frg::string_view name) {
+    auto to_remove = Directory::find(self, name);
+    if (to_remove.is<Rc<Directory>>()) {
+      return Directory::remove_dir(self, name);
+    } else if (to_remove.is<Rc<File>>()) {
+      return Directory::remove_file(self, name);
     }
     return ENOENT;
   }
@@ -483,13 +504,42 @@ class PathComponents {
   }
 };
 
+inline frg::string_view path_merge(frg::string_view previous,
+                                   frg::string_view append) {
+  // check if there is actually something to do
+  if (append.size() < 1) return previous;
+  // check if new path is absolute, if so return it
+  if (append.data()[0] == '/') return append;
+  auto append_components = PathComponents(append);
+  for (auto component = append_components.next(); component.size() > 0;
+       component = append_components.next()) {
+    if (component.data()[0] == '.') {
+      if (component.size() == 2 && component.data()[1] == '.') {
+        previous = path_split(previous).dir;
+        continue;
+      }
+      if (component.size() == 1) {
+        continue;
+      }
+    }
+    size_t prev_size = previous.size();
+    size_t comp_size = component.size();
+    char* new_path = (char*)getAllocator().reallocate(
+        (void*)previous.data(), prev_size + 1 + comp_size);
+    new_path[prev_size] = '/';
+    strncpy(new_path + prev_size + 1, component.data(), comp_size);
+    previous = frg::string_view(new_path, prev_size + comp_size + 1);
+  }
+}
+
 class FileTable {
   frg::vector<Rc<FileTableEntry>, MemoryAllocator> open_files{getAllocator()};
   Rc<Directory> working_dir;
+  frg::string_view working_dir_path = frg::string_view("/", 1);
   Rc<Directory> fs_root;
 
-  size_t find_free_slot() {
-    for (size_t i = 0; i < open_files.size(); ++i) {
+  size_t find_free_slot(size_t above = 0) {
+    for (size_t i = above; i < open_files.size(); ++i) {
       if (open_files[i] == nullptr) {
         return i;
       }
@@ -531,10 +581,10 @@ class FileTable {
 
   Rc<Directory> get_origin(int dirfd, const char* path) {
     Rc<Directory> base;
-    if (dirfd == AT_FDCWD) {
-      base = this->working_dir;
-    } else if (path[0] == '/') {
+    if (path[0] == '/') {
       base = this->fs_root;
+    } else if (dirfd == AT_FDCWD) {
+      base = this->working_dir;
     } else {
       auto entry = this->get(dirfd);
       if (entry == nullptr) {
@@ -549,10 +599,13 @@ class FileTable {
   }
 
   frg::variant<NoEntry, Rc<Directory>> create_dirs_from_string(
-      frg::string_view dir_path) {
+      frg::string_view dir_path, Rc<Directory> current = nullptr) {
     PathComponents components{dir_path};
 
-    auto current = this->fs_root;
+    if (current == nullptr) {
+      current = this->fs_root;
+    }
+
     for (auto component = components.next(); component.size() > 0;
          component = components.next()) {
       auto next = Directory::find(current, component);
@@ -639,6 +692,39 @@ class FileTable {
     this->fs_root = Rc<Directory>::make(Rc<Directory>{nullptr});
     this->fs_root->set_parent(this->fs_root);
     this->working_dir = this->fs_root;
+    this->working_dir_path = frg::string_view("/", 1);
+
+    // add output sets as directories do before inputs so
+    // we can stdout or stderr during rest of bring up
+    size_t num_ouput_sets = dandelion_output_set_count();
+    for (size_t i = 0; i < num_ouput_sets; i++) {
+      auto dirpath = string{dandelion_output_set_ident(i),
+                            dandelion_output_set_ident_len(i), getAllocator()};
+      create_dirs_from_string(dirpath);
+    }
+    // check add stdout and stderr
+    char stdio_chars[] = "stdio";
+    char stdout_chars[] = "stdout";
+    char stderr_chars[] = "stderr";
+    frg::string_view stdio_name = frg::string_view(stdio_chars, 5);
+    frg::string_view stdout_name = frg::string_view(stdout_chars, 6);
+    frg::string_view stderr_name = frg::string_view(stderr_chars, 6);
+    auto stdio = Directory::find(this->fs_root, stdio_name);
+    if (stdio.is<Rc<Directory>>()) {
+      auto stdio_dir = stdio.get<Rc<Directory>>();
+      auto out_file = Rc<File>::make();
+      Directory::link_file(stdio_dir, stdout_name, out_file);
+      this->create_entry_at(1, FileTableEntry::OpenFile{out_file, 0, O_WRONLY});
+
+      auto err_file = Rc<File>::make();
+      Directory::link_file(stdio_dir, stderr_name, err_file);
+      this->create_entry_at(2, FileTableEntry::OpenFile{err_file, 0, O_WRONLY});
+    } else {
+      this->create_entry_at(
+          1, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
+      this->create_entry_at(
+          2, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
+    }
 
     // add input sets and files
     size_t num_input_sets = dandelion_input_set_count();
@@ -648,32 +734,24 @@ class FileTable {
       for (size_t j = 0; j < num_bufs; ++j) {
         auto* buf = dandelion_get_input(i, j);
 
-        create_file_from_buf(i, buf);
+        if (create_file_from_buf(i, buf) != 0) {
+          char panic_message[] = "Could not create files from buffer\n";
+          ssize_t write_size;
+          this->get(2)->write(panic_message, sizeof(panic_message),
+                              &write_size);
+          sys_libc_panic();
+        }
       }
-    }
-    // add output sets as directories
-    size_t num_ouput_sets = dandelion_output_set_count();
-    for (size_t i = 0; i < num_ouput_sets; i++) {
-      auto dirpath = string{dandelion_output_set_ident(i),
-                            dandelion_output_set_ident_len(i), getAllocator()};
-      create_dirs_from_string(dirpath);
     }
 
     // check if there is a stdio dir
     // need to use char*, because string directly appends \0 which we don't want
-    char stdio_chars[] = "stdio";
     char stdin_chars[] = "stdin";
-    char stdout_chars[] = "stdout";
-    char stderr_chars[] = "stderr";
     char argv_chars[] = "argv";
     char env_chars[] = "environ";
-    frg::string_view stdio_name = frg::string_view(stdio_chars, 5);
     frg::string_view stdin_name = frg::string_view(stdin_chars, 5);
-    frg::string_view stdout_name = frg::string_view(stdout_chars, 6);
-    frg::string_view stderr_name = frg::string_view(stderr_chars, 6);
     frg::string_view argv_name = frg::string_view(argv_chars, 4);
     frg::string_view env_name = frg::string_view(env_chars, 7);
-    auto stdio = Directory::find(this->fs_root, stdio_name);
     if (stdio.is<Rc<Directory>>()) {
       auto stdio_dir = stdio.get<Rc<Directory>>();
 
@@ -681,6 +759,7 @@ class FileTable {
       Directory::remove_file(stdio_dir, argv_name);
       Directory::remove_file(stdio_dir, env_name);
 
+      // check if stdin file exists and remove it if so
       auto stdin = Directory::find(stdio_dir, stdin_name);
       if (stdin.is<Rc<File>>()) {
         auto stdin_file = stdin.get<Rc<File>>();
@@ -691,21 +770,9 @@ class FileTable {
         this->create_entry_at(
             0, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_RDONLY});
       }
-
-      auto out_file = Rc<File>::make();
-      Directory::link_file(stdio_dir, stdout_name, out_file);
-      this->create_entry_at(1, FileTableEntry::OpenFile{out_file, 0, O_WRONLY});
-
-      auto err_file = Rc<File>::make();
-      Directory::link_file(stdio_dir, stderr_name, err_file);
-      this->create_entry_at(2, FileTableEntry::OpenFile{err_file, 0, O_WRONLY});
     } else {
       this->create_entry_at(
           0, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_RDONLY});
-      this->create_entry_at(
-          1, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
-      this->create_entry_at(
-          2, FileTableEntry::OpenFile{Rc<File>::make(), 0, O_WRONLY});
     }
   }
 
@@ -732,7 +799,20 @@ class FileTable {
       return ENOENT;
     }
     this->working_dir = base;
+    // adapt current working directory path
+    this->working_dir_path = path_merge(this->working_dir_path, path);
     return 0;
+  }
+
+  // TODO might want to replace with a call taking a buffer and a size
+  // that directly assembles the string in the buffer
+  // also give directories their names so we can just traverse the file system
+  char* get_cwd() {
+    size_t stringlen = this->working_dir_path.size();
+    char* cwd = (char*)getAllocator().allocate(stringlen + 1);
+    strncpy(cwd, this->working_dir_path.data(), stringlen);
+    cwd[stringlen] = '\0';
+    return cwd;
   }
 
   int openat(int dirfd, const char* path, int flags, int* fd) {
@@ -770,7 +850,7 @@ class FileTable {
     } else if (res.is<NoEntry>()) {
       if (!(flags & O_CREAT)) {
         *fd = -1;
-        return EACCES;
+        return ENOENT;
       }
 
       Rc<Directory> loc = origin;
@@ -849,39 +929,107 @@ class FileTable {
 
   int linkat(int old_dirfd, const char* old_path, int new_dirfd,
              const char* new_path, int flags) {
-    (void)old_dirfd, (void)old_path, (void)new_dirfd, (void)new_path,
-        (void)flags;
-    return ENOSYS;
+    (void)flags;
+    // get file for old path
+    auto old_origin = this->get_origin(old_dirfd, old_path);
+    if (old_origin == nullptr) return EBADF;
+    auto old_file = Directory::find(old_origin, old_path);
+    if (old_file.is<NoEntry>()) {
+      return ENOENT;
+    }
+    // have found directory or file, now need to insert it at new_path
+    // make sure the new_path does not already exist
+    auto new_origin = this->get_origin(new_dirfd, new_path);
+    auto new_file = Directory::find(new_origin, new_path);
+    if (new_file.is<NoEntry>() != 0) return EEXIST;
+    auto new_path_split = path_split(new_path);
+    auto new_dir_var = create_dirs_from_string(new_path_split.dir, new_origin);
+    if (new_dir_var.is<NoEntry>()) return ENOENT;
+    Rc<Directory> new_dir = new_dir_var.get<Rc<Directory>>();
+    if (old_file.is<Rc<File>>()) {
+      Directory::link_file(new_dir, new_path_split.base,
+                           old_file.get<Rc<File>>());
+    } else {
+      Directory::link_dir(new_dir, new_path_split.base,
+                          old_file.get<Rc<Directory>>());
+    }
+    return 0;
   }
 
   int renameat(int old_dirfd, const char* old_path, int new_dirfd,
                const char* new_path) {
-    (void)old_dirfd, (void)old_path, (void)new_dirfd, (void)new_path;
-    return ENOSYS;
+    // get old file
+    auto old_path_split = path_split(old_path);
+    auto old_origin = this->get_origin(old_dirfd, old_path);
+    if (old_origin == nullptr) return EBADF;
+    // get old directory
+    auto old_dir_entry = Directory::find(old_origin, old_path_split.dir);
+    if (!old_dir_entry.is<Rc<Directory>>()) return ENOTDIR;
+    Rc<Directory> old_dir = old_dir_entry.get<Rc<Directory>>();
+    // get old file and remove it form directory
+    auto old_file_entry = Directory::find(old_dir, old_path_split.base);
+    int err = 0;
+    // also checks that file exists
+    err = Directory::remove(old_dir, old_path_split.base);
+    if (err != 0) return err;
+    // find new folder, do after remove to detect illegal moves
+    auto new_origin = this->get_origin(new_dirfd, new_path);
+    if (new_origin == nullptr) {
+      Directory::link(old_dir, old_path_split.base, old_file_entry);
+      return EBADF;
+    }
+    auto new_path_split = path_split(new_path);
+    auto new_dir_entry = Directory::find(new_origin, new_path_split.dir);
+    if (!new_dir_entry.is<Rc<Directory>>()) {
+      Directory::link(old_dir, old_path_split.base, old_file_entry);
+      return ENOTDIR;
+    }
+    Rc<Directory> new_dir = new_dir_entry.get<Rc<Directory>>();
+    auto new_file_entry = Directory::find(new_dir, new_path_split.base);
+    // do not replace if the current path points to non empty directory
+    if (new_file_entry.is<Rc<Directory>>()) {
+      Rc<Directory> new_file_dir = new_dir_entry.get<Rc<Directory>>();
+      if (!new_file_dir->is_empty()) {
+        Directory::link(old_dir, old_path_split.base, old_file_entry);
+        return ENOTEMPTY;
+      }
+    }
+    Directory::remove(new_dir, new_path_split.base);
+    Directory::link(new_dir, new_path_split.base, old_dir_entry);
+    return 0;
   }
 
   int fcntl(int fd, int cmd, int arg, int* result) {
-    (void)fd, (void)cmd, (void)arg, (void)result;
-    return ENOSYS;
-    // auto entry = this->get(fd);
-    // if (entry == nullptr) {
-    // 	return EBADF;
-    // }
-    // auto file = entry->get_file();
-    // if (file == nullptr) {
-    // 	return EISDIR;
-    // }
-    // // TODO implement more commands
-    // switch (cmd) {
-    // 	case F_GETFL:
-    // 		*result = file->get_flags();
-    // 		return 0;
-    // 	case F_SETFL:
-    // 		file->set_flags(arg);
-    // 		return 0;
-    // 	default:
-    // 		return EINVAL;
-    // }
+    (void)fd, (void)arg;
+    *result = 0;
+    auto entry = this->get(fd);
+    if (entry == nullptr) {
+      return EBADF;
+    }
+    // TODO implement more commands
+    switch (cmd) {
+      case F_DUPFD:
+      case F_DUPFD_CLOEXEC:
+        *result = this->find_free_slot((int)arg);
+        this->dup2(fd, *result);
+        return 0;
+      case F_GETFD:
+        *result = FD_CLOEXEC;
+        return 0;
+        // case F_GETFL:
+        // 		*result = file->get_flags();
+        // 		return 0;
+        // 	case F_SETFL:
+        // 		file->set_flags(arg);
+        // 		return 0;
+        // 	default:
+        // return EINVAL;
+        // }
+      default:
+        mlibc::infoLogger()
+            << "fcntl switch default cmd on " << cmd << frg::endlog;
+    }
+    return ENOKEY;
   }
 
   Rc<FileTableEntry> get(int fd) {
@@ -914,11 +1062,31 @@ class FileTable {
   }
 
   int close(int fd) {
-    if (fd <= 0 && static_cast<size_t>(fd) < this->open_files.size()) {
-      this->open_files[fd] = nullptr;
-      return 0;
+    if (check_fd(fd) != 0) {
+      return EBADF;
     }
-    return EBADF;
+    this->open_files[fd] = nullptr;
+    return 0;
+  }
+
+  int stat(int fd, struct stat* statbuf) {
+    if (statbuf == NULL) return EBADF;
+    int ret_val = check_fd(fd);
+    if (ret_val != 0) return EBADF;
+    *statbuf = {0};
+    FileTableEntry* current_file = this->open_files[fd].get();
+    if (current_file->internal.is<FileTableEntry::OpenFile>()) {
+      Rc<File> file = current_file->get_file();
+      if (file != nullptr) {
+        statbuf->st_size = file->size();
+        statbuf->st_mode =
+            S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+      }
+    } else {
+      statbuf->st_mode = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
+    }
+
+    return 0;
   }
 };
 

@@ -68,8 +68,9 @@ void sys_libc_log(const char *message) {
 }
 
 void sys_libc_panic() {
-  dandelion_exit(INT_MIN);
-  __builtin_unreachable();
+	vfs::get_file_table().finalize();
+  	dandelion_exit(INT_MIN);
+  	__builtin_unreachable();
 }
 
 int sys_tcb_set(void *pointer) {
@@ -193,15 +194,18 @@ int sys_clock_getres(int clock, time_t *secs, long *nanos) {
 }
 
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
-	(void)fd, (void)flags, (void)statbuf, (void)path;
 	// SYS_newfstatat
-	if (fsfdt == fsfd_target::path)
-		fd = AT_FDCWD;
-	else if (fsfdt == fsfd_target::fd)
+	if (fsfdt == fsfd_target::path){
+		int err = vfs::get_file_table().openat(AT_FDCWD, path, O_RDONLY, &fd);
+		if(err != 0) return err;
+	}
+	else if (fsfdt == fsfd_target::fd){
 		flags |= AT_EMPTY_PATH;
-	else
+	}
+	else{
 		__ensure(fsfdt == fsfd_target::fd_path);
-	return EACCES;
+	}
+	return vfs::get_file_table().stat(fd, statbuf);
 }
 
 int sys_statfs(const char *path, struct statfs *buf) {
@@ -255,14 +259,15 @@ int sys_fcntl(int fd, int cmd, va_list args, int *result) {
 int sys_getcwd(char *buf, size_t size) {
 	(void)buf, (void)size;
 	// TODO implement this
-	return ENOSYS;
-	// const char* cwd = vfs::get_file_table().get_cwd();
-	// size_t cwd_len = strlen(cwd) + 1;
-	// if (size < cwd_len) {
-	// 	return ERANGE;
-	// }
-	// strcpy(buf, cwd);
-	// return 0;
+	const char* cwd = vfs::get_file_table().get_cwd();
+	size_t cwd_len = strlen(cwd);
+	// need to add 0 char at end
+	if (size < cwd_len + 1) {
+		return ERANGE;
+	}
+	strncpy(buf, cwd, cwd_len);
+	buf[cwd_len] = '\0';
+	return 0;
 }
 
 int sys_unlinkat(int dfd, const char *path, int flags) {

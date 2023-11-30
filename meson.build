@@ -116,8 +116,9 @@ if host_machine.system() == 'linux'
 	libc_include_dirs += include_directories('sysdeps/linux/include')
 	subdir('sysdeps/linux')
 elif host_machine.system() == 'dandelion'
-
-	dandelion_interface = cmake.subproject('dandelionFunctionInterface')
+	interface_options = cmake.subproject_options()
+	interface_options.add_cmake_defines({'FREESTANDING': false})
+	dandelion_interface = cmake.subproject('dandelionFunctionInterface', options: interface_options)
 	dandelion_rt = dandelion_interface.dependency('dandelion_runtime')
 	dandelion_sys = dandelion_interface.dependency('dandelion_system')
 	libc_deps += dandelion_rt
